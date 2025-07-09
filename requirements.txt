@@ -17,6 +17,7 @@ scikit-learn
 pandas
 tqdm
 numpy
+matplotlib
 
 # (Optional but often handy for HF fine‑tuning)
 accelerate

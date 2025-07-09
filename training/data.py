@@ -11,7 +11,6 @@ import torch
 from PIL import Image, ImageFile
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from health_multimodal.image.data.io import load_image
 from .distributed import is_master
 
 # Add MONAI imports (simplified)
@@ -165,8 +164,8 @@ class CustomCSVDataset(Dataset):
             caption = shuffle_sentences(caption, probability=0.1)
         
         # Load and process images
-        prev_image = load_image(prev_path)
-        cur_image = load_image(cur_path)
+        prev_image = Image.open(prev_path).convert('RGB')
+        cur_image = Image.open(cur_path).convert('RGB')
         if self.transform:
             prev_image = self.transform(prev_image)
             cur_image = self.transform(cur_image)
@@ -243,7 +242,7 @@ class CustomCSVDataset(Dataset):
                 
             else:
                 # Fallback for regular image files (though not typical for CT)
-                image = load_image(img_path_obj)
+                image = Image.open(img_path_obj).convert('RGB')
                 if self.transform:
                     image = self.transform(image)
                     

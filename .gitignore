@@ -18,6 +18,7 @@ __pycache__/
 *.csv
 
 # Jupyter notebook files
+!visualize.ipynb
 *.ipynb
 
 # Common additional ignores for data science projects
