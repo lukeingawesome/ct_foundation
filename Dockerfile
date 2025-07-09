@@ -25,7 +25,7 @@ RUN apt-get update && \
         ninja-build cmake \
         libopenmpi-dev openmpi-bin \
         libglib2.0-0 libsm6 libxrender1 libxext6 \
-        tzdata openssh-client sudo && \
+        tzdata openssh-client sudo tmux && \
     rm -rf /var/lib/apt/lists/* && \
     git lfs install
 
