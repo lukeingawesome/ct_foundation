@@ -19,6 +19,10 @@ cd ct_foundation
 # Build and start the environment (automatically detects your user settings)
 make build
 make up
+
+# Or with custom project name:
+make PROJECT=my_project_name build
+make PROJECT=my_project_name up
 ```
 
 ## Available Commands
@@ -62,7 +66,7 @@ The Makefile automatically detects and uses:
 - `UID`: Your user ID for file ownership
 - `GID`: Your group ID for file ownership  
 - `USR`: Your username
-- `PROJECT`: Set to `hanbin_fm` (can be customized)
+- `PROJECT`: Defaults to `hanbin_fm` (can be overridden via command line)
 
 No manual `.env` file configuration needed! The system automatically handles user permissions.
 
@@ -147,11 +151,16 @@ The Makefile handles everything, but if you need manual control:
 ```bash
 # With automatic user detection
 export UID=$(id -u) GID=$(id -g) USR=$(whoami)
-docker-compose up -d
+docker compose up -d
 ```
 
 ### Custom Project Name
-Edit the `PROJECT` variable in the Makefile or set it via environment:
+You can override the default project name (`hanbin_fm`) from the command line:
 ```bash
-PROJECT=my_custom_name make build
+# Set custom project name for any command
+make PROJECT=my_custom_name build
+make PROJECT=my_custom_name up
+make PROJECT=my_custom_name shell
+
+# Or set it permanently by editing the PROJECT variable in the Makefile
 ```
