@@ -192,7 +192,7 @@ def evaluate(model, loader, loss_fn, device, labels,
     if isinstance(thresholds, float):
         preds = (logits > thresholds).astype(int)
     else:
-        preds = (logits > thresholds[np.newaxis, :]).astype(int)
+        preds = (logits > thresholds[None, :]).astype(int)
 
     metrics = {
         "val_loss":  tot_loss / len(loader),
@@ -278,7 +278,7 @@ def main(argv: Optional[List[str]] = None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # data
-    num_workers = max(2, os.cpu_count() // 2)
+    num_workers = max(2, (os.cpu_count() or 4) // 2)
     tr_loader, val_loader = make_loaders(
         args.csv, args.label_columns, args.batch_size, num_workers,
         args.three_channel, args.balance_sampler)
@@ -286,6 +286,7 @@ def main(argv: Optional[List[str]] = None):
     # model
     backbone = load_backbone(args.pretrained)
     model = SigLIPClassifier(backbone, len(args.label_columns), args.dropout)
+    model = model.to(device)
 
     freeze_regex(model.backbone, [s for s in args.freeze_regex.split(",") if s])
     # param groups: backbone vs head
@@ -297,9 +298,10 @@ def main(argv: Optional[List[str]] = None):
                     if "backbone" not in n and p.requires_grad],
          "lr": args.lr}
     ]
-    Optim = AdamW if args.optimizer == "adamw" else SGD
-    opt = Optim(param_groups, weight_decay=args.weight_decay,
-                momentum=0.9 if args.optimizer == "sgd" else 0.0)
+    if args.optimizer == "adamw":
+        opt = AdamW(param_groups, weight_decay=args.weight_decay)
+    else:
+        opt = SGD(param_groups, weight_decay=args.weight_decay, momentum=0.9)
 
     scaler = GradScaler(enabled=args.amp)
 
@@ -378,7 +380,7 @@ def main(argv: Optional[List[str]] = None):
         val_metrics["macro_f1_opt"] = macro_at_opt
 
         # (3) SWA scheduler step
-        if swa_model and epoch >= swa_start:
+        if swa_model and epoch >= swa_start and swa_scheduler:
             swa_scheduler.step()
 
         # (4) LR‑plateau step
