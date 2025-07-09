@@ -18,6 +18,7 @@ pandas
 tqdm
 numpy
 matplotlib
+nltk
 
 # (Optional but often handy for HF fine‑tuning)
 accelerate
