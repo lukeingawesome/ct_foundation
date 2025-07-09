@@ -1,0 +1,34 @@
+program: finetune_siglip_ct.py
+method: bayes
+metric:
+  name: macro_f1_opt
+  goal: maximize
+parameters:
+  wandb-name:
+    value: null
+  batch-size:
+    values: [6, 8, 10]
+  lr:
+    distribution: log_uniform
+    min: 1e-4
+    max: 5e-4
+  lr-backbone-mult:
+    values: [0.05, 0.1, 0.15]
+  freeze-epochs:
+    values: [0, 3]
+  dropout:
+    values: [0.1, 0.25]
+  focal_gamma:
+    values: [1.5, 2.0]
+  scheduler:
+    values: ["warmup", "cosine"]
+  use-swa:
+    values: [True, False]
+  three-channel:
+    value: True
+  balance-sampler:
+    value: True
+early_terminate:
+  type: hyperband
+  min_iter: 10
+  eta: 2

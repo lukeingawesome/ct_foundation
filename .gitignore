@@ -48,10 +48,9 @@ wandb/*
 # All tensorboard files
 tensorboard/
 
+# all runs
+runs/
 
-
-deepseek.py
-gemini.py
 wandb/latest-run
 
 # Testing artifacts

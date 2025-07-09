@@ -218,7 +218,7 @@ def main(argv: Optional[List[str]] = None):
     # data / labels
     parser.add_argument("--csv", default="/data/all_ct_with_labels.csv")
     parser.add_argument("--label-columns", nargs="+", default=None)
-    parser.add_argument("--three-channel", action="store_true", default=True)
+    parser.add_argument("--three-channel", action="store_true")
     parser.add_argument("--balance-sampler", action="store_true")
     # model
     parser.add_argument("--pretrained", default="/model/1c_siglip/pytorch_model.bin")
@@ -240,6 +240,12 @@ def main(argv: Optional[List[str]] = None):
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--use-ema", action="store_true", default=True)
     parser.add_argument("--use-swa", action="store_true", default=True)
+    # ───────── WandB (new)
+    parser.add_argument("--wandb-project", default="siglip-ct",
+                        help="Weights‑and‑Biases *project* (entity/project)")
+    parser.add_argument("--wandb-name", default=None,
+                        help="Run name as shown in the WandB UI "
+                             "(defaults to output‑folder name)")
     # misc
     parser.add_argument("--output", default="outputs")
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -259,8 +265,15 @@ def main(argv: Optional[List[str]] = None):
         args.label_columns = json.loads(Path(ROOT/"default_labels18.json").read_text())
         logging.info(f"Loaded {len(args.label_columns)} default labels")
 
+    # ───────── initialise WandB (after args, before training loop)
     if WANDB_OK:
-        wandb.init(project="siglip-ct", config=vars(args))
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_name or Path(args.output).name,
+            config=vars(args),
+            dir=args.output,          # run files go next to checkpoints
+            reinit=False,             # safer when ↻ in same process
+        )
     # devices
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

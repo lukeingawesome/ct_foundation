@@ -42,7 +42,7 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       PYTHONUNBUFFERED: "1"
       NCCL_P2P_DISABLE: "1"
-      HF_HOME: /workspace/${PROJECT}/.cache/huggingface
+      HF_HOME: ${PROJECT_ROOT:-/opt/project}/.cache/huggingface
       PROJECT: ${PROJECT}
 
     shm_size: 64gb            # large /dev/shm for MONAI 3‑D workloads

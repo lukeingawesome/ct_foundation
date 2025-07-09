@@ -81,7 +81,11 @@ ENV TORCH_CUDA_ARCH_LIST=8.6 \
 RUN groupadd -g ${GID} ${USERNAME} && \
     useradd  -m -s /bin/bash -u ${UID} -g ${GID} ${USERNAME} && \
     usermod  -aG sudo ${USERNAME} && \
-    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} && \
+    chmod 0440 /etc/sudoers.d/${USERNAME} && \
+    # Verify sudo access works
+    su - ${USERNAME} -c "sudo -n true" && \
+    echo "✓ Sudo privileges configured successfully for ${USERNAME}"
 
 RUN mkdir -p ${PROJECT_ROOT} \
     && chown -R ${USERNAME}:${USERNAME} ${PROJECT_ROOT} \

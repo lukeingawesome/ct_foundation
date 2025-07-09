@@ -10,7 +10,10 @@ python finetune_siglip.py \
   --epochs 60 \
   --lr 1e-4 \
   --lr-backbone-mult 0.05 \
+  --three-channel \
   --balance-sampler \
   --use-ema \
   --use-swa \
-  --amp 
+  --amp \
+  --wandb-project "chest-ct-siglip" \
+  --wandb-name "baseline-experiment" 
