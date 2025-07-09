@@ -9,6 +9,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 .tox/
+.env/
 
 # NPZ files (numpy compressed arrays)
 *.npz

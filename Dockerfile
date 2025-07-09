@@ -93,8 +93,21 @@ RUN mkdir -p ${PROJECT_ROOT} \
 RUN mkdir -p /home/${USERNAME}/.cursor-server \
     && chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.cursor-server
 
+# Create a startup script to fix permissions
+RUN echo '#!/bin/bash' > /usr/local/bin/fix-permissions.sh && \
+    echo 'if [ -d "${PROJECT_ROOT}" ]; then' >> /usr/local/bin/fix-permissions.sh && \
+    echo '    sudo chown -R ${USERNAME}:${USERNAME} ${PROJECT_ROOT}' >> /usr/local/bin/fix-permissions.sh && \
+    echo '    sudo chmod -R u+rw ${PROJECT_ROOT}' >> /usr/local/bin/fix-permissions.sh && \
+    echo '    find ${PROJECT_ROOT} -type d -exec sudo chmod u+rwx {} \;' >> /usr/local/bin/fix-permissions.sh && \
+    echo 'fi' >> /usr/local/bin/fix-permissions.sh && \
+    echo 'exec "$@"' >> /usr/local/bin/fix-permissions.sh && \
+    chmod +x /usr/local/bin/fix-permissions.sh
+
 USER ${USERNAME}
 WORKDIR ${PROJECT_ROOT}
+
+# Use the permission fix script as entrypoint
+ENTRYPOINT ["/usr/local/bin/fix-permissions.sh"]
 
 # VS Code / Cursor will upload its own server here; no need to pre‑create
 CMD [ "/bin/bash", "--login" ]
