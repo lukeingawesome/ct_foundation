@@ -4,7 +4,7 @@
 export UID := $(shell id -u)
 export GID := $(shell id -g)
 export USR := $(shell whoami)
-export PROJECT := hanbin_fm
+export PROJECT ?= hanbin_fm
 export PROJECT_ROOT := /opt/project
 
 .PHONY: env build up down restart shell clean help
@@ -48,27 +48,27 @@ env:
 # Build the Docker image (automatically uses current user settings)
 build:
 	@echo "Building with UID=$(UID), GID=$(GID), USR=$(USR)"
-	@docker-compose build
+	@docker compose build
 
 # Start the container
 up:
 	@echo "Starting container with UID=$(UID), GID=$(GID), USR=$(USR)"
-	@docker-compose up -d
+	@docker compose up -d
 
 # Stop and remove the container
 down:
-	@docker-compose down
+	@docker compose down
 
 # Restart the container
 restart: down up
 
 # Open a shell in the running container
 shell:
-	@docker-compose exec irail /bin/bash
+	@docker compose exec irail /bin/bash
 
 # Remove container and image
 clean:
-	@docker-compose down --rmi all --volumes --remove-orphans
+	@docker compose down --rmi all --volumes --remove-orphans
 
 # Force recreate .env file
 env-force:
