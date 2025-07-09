@@ -12,6 +12,7 @@ Adds:
 
 from __future__ import annotations
 import argparse, logging, os, random, sys, warnings, re, math, json
+import torch.distributed as dist
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 # test
@@ -22,11 +23,15 @@ from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.optim.swa_utils import AveragedModel, SWALR
 from transformers.optimization import get_cosine_schedule_with_warmup
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
 from tqdm import tqdm
+
+# --- make PyTorch checkpoint use the non‑reentrant engine -------------
+import torch.utils.checkpoint as cp
+if hasattr(cp, "config"):
+    cp.config.set_reentrant(False)        # pytorch ≥1.13
+# ----------------------------------------------------------------------
 
 # ───────────────────────────────────────────────────────
 try:
@@ -107,11 +112,19 @@ class SigLIPClassifier(nn.Module):
         return self.head(feat)
 
 # ───────────────────────────────────────────────────────
-def _hu(vol, c, w):
-    lo, hi = c - w / 2, c + w / 2
-    out = np.clip(vol, lo, hi).astype(np.float32)
-    out -= lo; out /= w
-    return out
+def _hu_window_to_unit(volume: np.ndarray,
+                       center: float,
+                       width: float) -> np.ndarray:
+    """
+    Clip a HU volume to the given window and scale to [0,1].
+    Args
+        volume : raw HU ndarray, shape (D,H,W) or (C,D,H,W)
+        center : window centre in HU
+        width  : window width in HU
+    """
+    lower, upper = center - width / 2.0, center + width / 2.0
+    vol = np.clip(volume, lower, upper)
+    return (vol - lower) / (upper - lower)
 
 class CTDataset(Dataset):
     """Loads npz volumes and on‑the‑fly window mixing."""
@@ -133,12 +146,24 @@ class CTDataset(Dataset):
             return self.__getitem__(random.randint(0, len(self) - 1))
 
         if self.three_ch:
-            vol = arr[0]                                   # (D,H,W)
-            # optional random channel masking / swapping
-            lung  = _hu(vol, -600, 1500)
-            medi  = _hu(vol,   40,  400)
-            bone  = _hu(vol,  700, 1800)
+            if arr.max() <= 1.0:                         # heuristic
+                arr = arr * 2500.0 - 1000.0              # back‑to‑HU
+
+            # arr shape: (C,D,H,W) or (D,H,W); unify to (D,H,W)
+            if arr.ndim == 4:
+                arr = arr[0]        # assume first channel is full‑range HU
+            
+            # Generate three standard windows
+            #    lung (centre -600, width 1000)
+            #    mediastinum (centre  40, width  400)
+            #    bone (centre 700, width 1500)
+            lung  = _hu_window_to_unit(arr,  -600, 1000)
+            medi  = _hu_window_to_unit(arr,    40,  400)
+            bone  = _hu_window_to_unit(arr,   700, 1500)
+
             channels = [lung, medi, bone]
+            
+            # optional random channel masking / swapping
             if random.random() < .15: random.shuffle(channels)
             if random.random() < .15:
                 i = random.randint(0, 2); channels[i] = np.zeros_like(channels[i])
@@ -251,18 +276,9 @@ def evaluate(model, loader, loss_fn, device, labels,
             out = model(x); tot_loss += loss_fn(out, y).item()
             logits.append(torch.sigmoid(out).cpu()); gts.append(y.cpu())
     
-    # Gather results from all processes
     if logits:
-        logits_tensor = torch.cat(logits, dim=0)
-        gts_tensor = torch.cat(gts, dim=0)
-        
-        # In distributed mode, gather from all processes
-        if dist.is_initialized():
-            logits_tensor = gather_tensors(logits_tensor)
-            gts_tensor = gather_tensors(gts_tensor)
-        
-        logits = logits_tensor.numpy()
-        gts = gts_tensor.numpy()
+        logits = torch.cat(logits, dim=0).numpy()
+        gts = torch.cat(gts, dim=0).numpy()
     else:
         logits = np.array([]).reshape(0, len(labels))
         gts = np.array([]).reshape(0, len(labels))
@@ -294,6 +310,9 @@ def evaluate(model, loader, loss_fn, device, labels,
 # ───────────────────────────────────────────────────────
 def main(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser()
+    # ───────── DDP
+    parser.add_argument("--local_rank", type=int, default=int(os.getenv("LOCAL_RANK", 0)),
+                        help="passed by torchrun; no need to set manually")
     # data / labels
     parser.add_argument("--csv", default="/data/all_ct_with_labels.csv")
     parser.add_argument("--label-columns", nargs="+", default=None)
@@ -332,30 +351,35 @@ def main(argv: Optional[List[str]] = None):
     parser.add_argument("--patience", type=int, default=12)
     args = parser.parse_args(argv)
 
-    # Setup distributed training
-    rank, world_size, local_rank = setup_distributed()
-    
-    # Only setup logging on main process
-    if is_main_process():
-        logging.basicConfig(
-            level=getattr(logging, args.log_level.upper()),
-            format="%(asctime)s | %(levelname)s | %(message)s",
-            handlers=[logging.StreamHandler(sys.stdout)]
-        )
+    # world size / rank
+    world_size = int(os.getenv("WORLD_SIZE", 1))
+    rank       = int(os.getenv("RANK", 0))
+    distributed = world_size > 1
+
+    # ensure only rank‑0 prints unless explicitly desired
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()) if rank == 0 else logging.ERROR,
+        format=f"%(asctime)s | r{rank} | %(levelname)s | %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+
+    # initialise DDP
+    if distributed and not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
     
     set_seed(42 + rank)  # Different seed per process
     
-    if is_main_process():
+    if rank == 0:
         Path(args.output).mkdir(parents=True, exist_ok=True)
 
     # default labels if not supplied
     if args.label_columns is None:
         args.label_columns = json.loads(Path(ROOT/"default_labels18.json").read_text())
-        if is_main_process():
+        if rank == 0:
             logging.info(f"Loaded {len(args.label_columns)} default labels")
 
     # ───────── initialise WandB (after args, before training loop)
-    if WANDB_OK and is_main_process():
+    if WANDB_OK and rank == 0:
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_name or Path(args.output).name,
@@ -363,27 +387,40 @@ def main(argv: Optional[List[str]] = None):
             dir=args.output,          # run files go next to checkpoints
             reinit=False,             # safer when ↻ in same process
         )
-    # devices
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    torch.cuda.set_device(args.local_rank)
+    device = torch.device("cuda", args.local_rank)
 
     # data
     num_workers = max(2, (os.cpu_count() or 4) // 2)
     tr_loader, val_loader = make_loaders(
         args.csv, args.label_columns, args.batch_size, num_workers,
-        args.three_channel, args.balance_sampler, rank, world_size)
+        args.three_channel, args.balance_sampler)
+
+    # wrap samplers in DistributedSampler
+    if distributed:
+        if args.balance_sampler:
+            warnings.warn("Balance‑sampler disabled in DDP (fallback to uniform shuffle)")
+        tr_loader = DataLoader(
+            tr_loader.dataset,
+            batch_size=args.batch_size,
+            sampler=DistributedSampler(tr_loader.dataset, shuffle=True),
+            num_workers=num_workers, pin_memory=True, persistent_workers=True)
+        val_loader = DataLoader(
+            val_loader.dataset,
+            batch_size=args.batch_size,
+            sampler=DistributedSampler(val_loader.dataset, shuffle=False),
+            num_workers=num_workers, pin_memory=True, persistent_workers=True)
 
     # model
     backbone = load_backbone(args.pretrained)
-    model = SigLIPClassifier(backbone, len(args.label_columns), args.dropout)
-    model = model.to(device)
-
-    # Wrap model with DDP for distributed training
-    if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                    find_unused_parameters=False)
+    model = SigLIPClassifier(backbone, len(args.label_columns), args.dropout).to(device)
+    if distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.local_rank], output_device=args.local_rank,
+            find_unused_parameters=True, static_graph=True)  # Required when using frozen parameters
 
     # Get the actual model for parameter access (unwrap DDP if needed)
-    model_module = model.module if hasattr(model, 'module') else model
+    model_module = model.module if distributed else model
 
     freeze_regex(model_module.backbone, [s for s in args.freeze_regex.split(",") if s])
     # param groups: backbone vs head
@@ -428,25 +465,25 @@ def main(argv: Optional[List[str]] = None):
     best_f1, patience = 0., 0
     thresholds = np.full(len(args.label_columns), args.threshold, dtype=np.float32)
 
-    if WANDB_OK and is_main_process():
+    if WANDB_OK and rank == 0:
         wandb.watch(model, log='all', log_freq=100)
 
     # training loop ────────────────────────────────────
     for epoch in range(1, args.epochs + 1):
-        # Set epoch for distributed sampler
-        if hasattr(tr_loader.sampler, 'set_epoch'):
+        if distributed and isinstance(tr_loader.sampler, DistributedSampler):
             tr_loader.sampler.set_epoch(epoch)
         
         # (1) freeze schedule
         if epoch == args.freeze_epochs + 1:
+            model_module = model.module if distributed else model
             for p in model_module.backbone.parameters(): p.requires_grad = True
-            if is_main_process():
+            if rank == 0:
                 logging.info("Backbone unfrozen")
 
         model.train(); running = 0.
         
         # Only show progress bar on main process
-        if is_main_process():
+        if rank == 0:
             pbar = tqdm(enumerate(tr_loader, 1), total=len(tr_loader), ncols=120,
                         desc=f"epoch[{epoch:03d}]")
         else:
@@ -465,10 +502,10 @@ def main(argv: Optional[List[str]] = None):
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 scaler.step(opt); scaler.update(); opt.zero_grad()
-                if ema: ema.update_parameters(model_module)
-                if swa_model and epoch >= swa_start: swa_model.update_parameters(model_module)
+                if ema: ema.update_parameters(model.module if distributed else model)
+                if swa_model and epoch >= swa_start: swa_model.update_parameters(model.module if distributed else model)
             
-            if is_main_process() and hasattr(pbar, 'set_postfix'):
+            if rank == 0 and hasattr(pbar, 'set_postfix'):
                 pbar.set_postfix(loss=f"{running/step:.4f}")
 
         # scheduler step
@@ -480,46 +517,37 @@ def main(argv: Optional[List[str]] = None):
         else:
             sch.step()
 
-        # (2) validation
-        eval_model = ema if ema else model_module
-        val_metrics, val_logits, val_gts = evaluate(
-            eval_model, val_loader, criterion, device, args.label_columns, thresholds)
+        # (2) validation — only on rank‑0
+        if rank == 0:
+            eval_model = ema if ema else model.module if distributed else model
+            val_metrics, val_logits, val_gts = evaluate(
+                eval_model, val_loader, criterion, device,
+                args.label_columns, thresholds)
+        else:
+            val_metrics = {}
 
         # dynamic threshold search each epoch (only on main process)
-        if is_main_process():
+        if rank == 0:
             thresholds, macro_at_opt = search_thresholds(val_logits, val_gts)
             val_metrics["macro_f1_opt"] = macro_at_opt
-
-        # Synchronize thresholds across processes
-        if world_size > 1:
-            thresholds_tensor = torch.tensor(thresholds, device=device)
-            dist.broadcast(thresholds_tensor, 0)
-            thresholds = thresholds_tensor.cpu().numpy()
-            
-            # Broadcast the macro_f1_opt metric too
-            macro_f1_opt_tensor = torch.tensor(val_metrics.get("macro_f1_opt", 0.0), device=device)
-            dist.broadcast(macro_f1_opt_tensor, 0)
-            val_metrics["macro_f1_opt"] = macro_f1_opt_tensor.item()
 
         # (3) SWA scheduler step
         if swa_model and epoch >= swa_start and swa_scheduler:
             swa_scheduler.step()
 
-        # (4) LR‑plateau step
-        if args.scheduler == "plateau":
+        if rank == 0 and args.scheduler == "plateau":
             sch.step(val_metrics["macro_f1"])
 
-        # log (only on main process)
-        if is_main_process():
+        if rank == 0:
             msg = " | ".join(f"{k}:{v:.4f}" if isinstance(v, float) else f"{k}:{v}"
                              for k, v in val_metrics.items() if not k.endswith("_precision")
                                                                         and not k.endswith("_recall"))
             logging.info(f"Epoch {epoch:03d} – {msg}")
 
-            if WANDB_OK: wandb.log({"epoch": epoch, **val_metrics})
+        if WANDB_OK and rank == 0:
+            wandb.log({"epoch": epoch, **val_metrics})
 
-        # (5) checkpoint & early stop (only on main process)
-        if is_main_process():
+        if rank == 0:
             ckpt_path = Path(args.output) / f"epoch_{epoch}.pth"
             torch.save({"epoch": epoch, "model": eval_model.state_dict(),
                         "opt": opt.state_dict(), "sch": sch.state_dict(),
@@ -536,33 +564,27 @@ def main(argv: Optional[List[str]] = None):
                 if patience >= args.patience:
                     logging.info("Early stopping ↑ patience exhausted")
                     break
-        
-        # Synchronize early stopping across processes
-        if world_size > 1:
-            stop_tensor = torch.tensor(patience >= args.patience, dtype=torch.bool, device=device)
-            dist.broadcast(stop_tensor, 0)
-            if stop_tensor.item():
-                break
 
     # (6) SWA batchnorm update + final eval
-    if swa_model:
+    if rank == 0 and swa_model:
         torch.optim.swa_utils.update_bn(tr_loader, swa_model, device=device)
         final_model = swa_model
     else:
-        final_model = ema if ema else model_module
+        final_model = ema if ema else (model.module if distributed else model)
 
-    final_metrics, *_ = evaluate(final_model, val_loader,
-                                 criterion, device, args.label_columns, thresholds)
-    
-    if is_main_process():
+    if rank == 0:
+        final_metrics, *_ = evaluate(final_model, val_loader,
+                                     criterion, device, args.label_columns, thresholds)
         logging.info("Final metrics:\n" +
                      "\n".join(f"  {k:>15s}: {v:.4f}" for k, v in final_metrics.items()
                                if isinstance(v, float)))
         if WANDB_OK:
             wandb.summary.update(final_metrics)
             wandb.finish()
-    
-    # Cleanup distributed training
-    cleanup_distributed()
+
+    # clean up
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 if __name__ == "__main__": main()

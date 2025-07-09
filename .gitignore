@@ -29,6 +29,7 @@ __pycache__/
 *.tmp
 *.temp
 
+
 # Model checkpoints and weights
 *.pth
 *.pt
@@ -36,7 +37,7 @@ __pycache__/
 *.json
 *.pkl
 *.pickle
-
+!default_labels18.json
 # Data directories (uncomment if needed)
 # data/
 # datasets/
