@@ -1,0 +1,62 @@
+version: "3.9"
+
+services:
+  irail:
+    # ────────────────────────────────────────
+    # Image build
+    # ────────────────────────────────────────
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID:       ${UID:-1000}
+        GID:       ${GID:-1000}
+        USERNAME:  ${USR:-user}
+        PROJECT:   ${PROJECT}
+
+    # The container will literally be named "${PROJECT}"
+    container_name: ${PROJECT}
+
+    # Fixed image name
+    image: irail:chest_fm
+
+    # ────────────────────────────────────────
+    # Runtime behaviour
+    # ────────────────────────────────────────
+    stdin_open: true          # <- enables `docker start -ai`
+    tty: true                 # <- ditto
+    init: true                # tiny init so ^C is handled
+
+    # keep both styles: old (<24) and new (24+) GPU wiring
+    runtime: nvidia           # ignored on Docker 24, required on ≤23
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTHONUNBUFFERED: "1"
+      NCCL_P2P_DISABLE: "1"
+      HF_HOME: /workspace/${PROJECT}/.cache/huggingface
+      PROJECT: ${PROJECT}
+
+    shm_size: 64gb            # large /dev/shm for MONAI 3‑D workloads
+
+    # ────────────────────────────────────────
+    # Volumes  ❗  DO NOT share ~/.vscode‑server
+    # ────────────────────────────────────────
+    volumes:
+      - .:${PROJECT_ROOT:-/opt/project}
+      - /BARO_Cluster/data/data:/data2          # read‑only data
+      - /home/data:/data
+      - /home/model:/model
+
+    working_dir: ${PROJECT_ROOT:-/opt/project}
+
+    # Interactive login shell keeps the container running
+    command: [ "/bin/bash", "--login" ]
