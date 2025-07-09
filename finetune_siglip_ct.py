@@ -7,13 +7,14 @@ Adds:
 • 3‑D aug, discriminative LR, focal‑BCE combo, dynamic threshold search
 • Gradual unfreezing, SWA, EMA, WandB histograms
 • Cleaner CLI, better typing, fewer global variables
+• Multi-GPU distributed training support
 """
 
 from __future__ import annotations
 import argparse, logging, os, random, sys, warnings, re, math, json
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-
+# test
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 from sklearn.metrics import f1_score, precision_recall_fscore_support, roc_auc_score
 from torch.cuda.amp import GradScaler, autocast
@@ -22,6 +23,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.optim.swa_utils import AveragedModel, SWALR
 from transformers.optimization import get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 from tqdm import tqdm
 
 # ───────────────────────────────────────────────────────
@@ -35,6 +39,30 @@ ROOT = Path(__file__).resolve().parent
 sys.path.append(str(ROOT / "training"))
 from training.ct_transform import get_train_transform, get_val_transform
 from merlin import Merlin
+
+# ───────────────────────────────────────────────────────
+def setup_distributed():
+    """Initialize distributed training if available."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        
+        return rank, world_size, local_rank
+    else:
+        return 0, 1, 0
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process():
+    """Check if this is the main process (rank 0)."""
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 # ───────────────────────────────────────────────────────
 def set_seed(seed: int = 42):
@@ -123,11 +151,22 @@ class CTDataset(Dataset):
 
 # ───────────────────────────────────────────────────────
 def make_loaders(csv: str, labels: List[str], bs: int, nw: int, three_ch: bool,
-                 balance: bool):
+                 balance: bool, rank: int = 0, world_size: int = 1):
     train_ds = CTDataset(csv, labels, "train", get_train_transform(), three_ch)
     val_ds   = CTDataset(csv, labels, "val",   get_val_transform(),   three_ch)
 
-    if balance:
+    # Distributed training setup
+    use_distributed = world_size > 1
+    
+    if use_distributed:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
+        
+        train_loader = DataLoader(train_ds, bs, sampler=train_sampler,
+                                  num_workers=nw, pin_memory=True, persistent_workers=True)
+        val_loader = DataLoader(val_ds, bs, sampler=val_sampler,
+                                num_workers=nw, pin_memory=True, persistent_workers=True)
+    elif balance:
         y = train_ds.df[labels].values
         # sample weights = #neg / #pos  (per class)  → flatten for multilabel
         cls_weights = (y.shape[0] - y.sum(0)) / (y.sum(0) + 1e-6)
@@ -135,12 +174,13 @@ def make_loaders(csv: str, labels: List[str], bs: int, nw: int, three_ch: bool,
         sampler = WeightedRandomSampler(w, num_samples=len(w), replacement=True)
         train_loader = DataLoader(train_ds, bs, sampler=sampler,
                                   num_workers=nw, pin_memory=True, persistent_workers=True)
+        val_loader = DataLoader(val_ds, bs, shuffle=False,
+                                num_workers=nw, pin_memory=True, persistent_workers=True)
     else:
         train_loader = DataLoader(train_ds, bs, shuffle=True,
                                   num_workers=nw, pin_memory=True, persistent_workers=True)
-
-    val_loader = DataLoader(val_ds, bs, shuffle=False,
-                            num_workers=nw, pin_memory=True, persistent_workers=True)
+        val_loader = DataLoader(val_ds, bs, shuffle=False,
+                                num_workers=nw, pin_memory=True, persistent_workers=True)
 
     return train_loader, val_loader
 
@@ -179,6 +219,29 @@ def search_thresholds(logits: np.ndarray, gts: np.ndarray,
     return best, macro
 
 # ───────────────────────────────────────────────────────
+def reduce_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Reduce tensor across all processes in distributed training."""
+    if not dist.is_initialized():
+        return tensor
+    
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    rt /= dist.get_world_size()
+    return rt
+
+def gather_tensors(tensor: torch.Tensor) -> torch.Tensor:
+    """Gather tensors from all processes."""
+    if not dist.is_initialized():
+        return tensor
+    
+    # Get the size of each tensor on each process
+    world_size = dist.get_world_size()
+    tensor_list = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(tensor_list, tensor)
+    
+    return torch.cat(tensor_list, dim=0)
+
+# ───────────────────────────────────────────────────────
 def evaluate(model, loader, loss_fn, device, labels,
              thresholds: np.ndarray | float):
     model.eval(); tot_loss, logits, gts = 0., [], []
@@ -186,8 +249,23 @@ def evaluate(model, loader, loss_fn, device, labels,
         for x, y in loader:
             x, y = x.to(device, non_blocking=True), y.to(device)
             out = model(x); tot_loss += loss_fn(out, y).item()
-            logits.append(torch.sigmoid(out).cpu().numpy()); gts.append(y.cpu().numpy())
-    logits = np.concatenate(logits); gts = np.concatenate(gts)
+            logits.append(torch.sigmoid(out).cpu()); gts.append(y.cpu())
+    
+    # Gather results from all processes
+    if logits:
+        logits_tensor = torch.cat(logits, dim=0)
+        gts_tensor = torch.cat(gts, dim=0)
+        
+        # In distributed mode, gather from all processes
+        if dist.is_initialized():
+            logits_tensor = gather_tensors(logits_tensor)
+            gts_tensor = gather_tensors(gts_tensor)
+        
+        logits = logits_tensor.numpy()
+        gts = gts_tensor.numpy()
+    else:
+        logits = np.array([]).reshape(0, len(labels))
+        gts = np.array([]).reshape(0, len(labels))
 
     if isinstance(thresholds, float):
         preds = (logits > thresholds).astype(int)
@@ -195,19 +273,20 @@ def evaluate(model, loader, loss_fn, device, labels,
         preds = (logits > thresholds[None, :]).astype(int)
 
     metrics = {
-        "val_loss":  tot_loss / len(loader),
+        "val_loss":  tot_loss / len(loader) if len(loader) > 0 else 0.0,
         "macro_f1":  f1_score(gts, preds, average="macro", zero_division=0),
         "micro_f1":  f1_score(gts, preds, average="micro", zero_division=0),
-        "macro_auc": roc_auc_score(gts, logits, average="macro")
+        "macro_auc": roc_auc_score(gts, logits, average="macro") if gts.shape[0] > 0 else 0.0
     }
     # per‑class metrics (precision / recall / auc)
     pr, rc, f1, _ = precision_recall_fscore_support(
         gts, preds, average=None, zero_division=0, labels=range(len(labels)))
-    auc = [roc_auc_score(gts[:, i], logits[:, i]) for i in range(len(labels))]
+    auc = [roc_auc_score(gts[:, i], logits[:, i]) if gts.shape[0] > 0 else 0.0 
+           for i in range(len(labels))]
     for i, name in enumerate(labels):
-        metrics[f"{name}_precision"] = pr[i]
-        metrics[f"{name}_recall"]    = rc[i]
-        metrics[f"{name}_f1"]        = f1[i]
+        metrics[f"{name}_precision"] = pr[i] if i < len(pr) else 0.0
+        metrics[f"{name}_recall"]    = rc[i] if i < len(rc) else 0.0
+        metrics[f"{name}_f1"]        = f1[i] if i < len(f1) else 0.0
         metrics[f"{name}_auc"]       = auc[i]
 
     return metrics, logits, gts
@@ -253,20 +332,30 @@ def main(argv: Optional[List[str]] = None):
     parser.add_argument("--patience", type=int, default=12)
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper()),
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)]
-    )
-    set_seed(42); Path(args.output).mkdir(parents=True, exist_ok=True)
+    # Setup distributed training
+    rank, world_size, local_rank = setup_distributed()
+    
+    # Only setup logging on main process
+    if is_main_process():
+        logging.basicConfig(
+            level=getattr(logging, args.log_level.upper()),
+            format="%(asctime)s | %(levelname)s | %(message)s",
+            handlers=[logging.StreamHandler(sys.stdout)]
+        )
+    
+    set_seed(42 + rank)  # Different seed per process
+    
+    if is_main_process():
+        Path(args.output).mkdir(parents=True, exist_ok=True)
 
     # default labels if not supplied
     if args.label_columns is None:
         args.label_columns = json.loads(Path(ROOT/"default_labels18.json").read_text())
-        logging.info(f"Loaded {len(args.label_columns)} default labels")
+        if is_main_process():
+            logging.info(f"Loaded {len(args.label_columns)} default labels")
 
     # ───────── initialise WandB (after args, before training loop)
-    if WANDB_OK:
+    if WANDB_OK and is_main_process():
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_name or Path(args.output).name,
@@ -275,26 +364,34 @@ def main(argv: Optional[List[str]] = None):
             reinit=False,             # safer when ↻ in same process
         )
     # devices
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     # data
     num_workers = max(2, (os.cpu_count() or 4) // 2)
     tr_loader, val_loader = make_loaders(
         args.csv, args.label_columns, args.batch_size, num_workers,
-        args.three_channel, args.balance_sampler)
+        args.three_channel, args.balance_sampler, rank, world_size)
 
     # model
     backbone = load_backbone(args.pretrained)
     model = SigLIPClassifier(backbone, len(args.label_columns), args.dropout)
     model = model.to(device)
 
-    freeze_regex(model.backbone, [s for s in args.freeze_regex.split(",") if s])
+    # Wrap model with DDP for distributed training
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=False)
+
+    # Get the actual model for parameter access (unwrap DDP if needed)
+    model_module = model.module if hasattr(model, 'module') else model
+
+    freeze_regex(model_module.backbone, [s for s in args.freeze_regex.split(",") if s])
     # param groups: backbone vs head
     param_groups = [
-        {"params": [p for n, p in model.named_parameters()
+        {"params": [p for n, p in model_module.named_parameters()
                     if "backbone" in n and p.requires_grad],
          "lr": args.lr * args.lr_backbone_mult},
-        {"params": [p for n, p in model.named_parameters()
+        {"params": [p for n, p in model_module.named_parameters()
                     if "backbone" not in n and p.requires_grad],
          "lr": args.lr}
     ]
@@ -315,10 +412,10 @@ def main(argv: Optional[List[str]] = None):
         sch = ReduceLROnPlateau(opt, mode="max", factor=.5, patience=5)
 
     # SWA + EMA
-    swa_model = AveragedModel(model) if args.use_swa else None
+    swa_model = AveragedModel(model_module) if args.use_swa else None
     swa_start = int(args.epochs * 0.6)
     swa_scheduler = SWALR(opt, swa_lr=args.lr * 0.05) if args.use_swa else None
-    ema = AveragedModel(model, avg_fn=None) if args.use_ema else None
+    ema = AveragedModel(model_module, avg_fn=None) if args.use_ema else None
 
     # loss
     pos_w = torch.tensor(
@@ -331,19 +428,30 @@ def main(argv: Optional[List[str]] = None):
     best_f1, patience = 0., 0
     thresholds = np.full(len(args.label_columns), args.threshold, dtype=np.float32)
 
-    if WANDB_OK:
+    if WANDB_OK and is_main_process():
         wandb.watch(model, log='all', log_freq=100)
 
     # training loop ────────────────────────────────────
     for epoch in range(1, args.epochs + 1):
+        # Set epoch for distributed sampler
+        if hasattr(tr_loader.sampler, 'set_epoch'):
+            tr_loader.sampler.set_epoch(epoch)
+        
         # (1) freeze schedule
         if epoch == args.freeze_epochs + 1:
-            for p in model.backbone.parameters(): p.requires_grad = True
-            logging.info("Backbone unfrozen")
+            for p in model_module.backbone.parameters(): p.requires_grad = True
+            if is_main_process():
+                logging.info("Backbone unfrozen")
 
         model.train(); running = 0.
-        pbar = tqdm(enumerate(tr_loader, 1), total=len(tr_loader), ncols=120,
-                    desc=f"epoch[{epoch:03d}]")
+        
+        # Only show progress bar on main process
+        if is_main_process():
+            pbar = tqdm(enumerate(tr_loader, 1), total=len(tr_loader), ncols=120,
+                        desc=f"epoch[{epoch:03d}]")
+        else:
+            pbar = enumerate(tr_loader, 1)
+        
         opt.zero_grad()
 
         for step, (x, y) in pbar:
@@ -357,9 +465,11 @@ def main(argv: Optional[List[str]] = None):
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 scaler.step(opt); scaler.update(); opt.zero_grad()
-                if ema: ema.update_parameters(model)
-                if swa_model and epoch >= swa_start: swa_model.update_parameters(model)
-            pbar.set_postfix(loss=f"{running/step:.4f}")
+                if ema: ema.update_parameters(model_module)
+                if swa_model and epoch >= swa_start: swa_model.update_parameters(model_module)
+            
+            if is_main_process() and hasattr(pbar, 'set_postfix'):
+                pbar.set_postfix(loss=f"{running/step:.4f}")
 
         # scheduler step
         if args.scheduler == "plateau":
@@ -371,13 +481,25 @@ def main(argv: Optional[List[str]] = None):
             sch.step()
 
         # (2) validation
-        eval_model = ema if ema else model
+        eval_model = ema if ema else model_module
         val_metrics, val_logits, val_gts = evaluate(
             eval_model, val_loader, criterion, device, args.label_columns, thresholds)
 
-        # dynamic threshold search each epoch
-        thresholds, macro_at_opt = search_thresholds(val_logits, val_gts)
-        val_metrics["macro_f1_opt"] = macro_at_opt
+        # dynamic threshold search each epoch (only on main process)
+        if is_main_process():
+            thresholds, macro_at_opt = search_thresholds(val_logits, val_gts)
+            val_metrics["macro_f1_opt"] = macro_at_opt
+
+        # Synchronize thresholds across processes
+        if world_size > 1:
+            thresholds_tensor = torch.tensor(thresholds, device=device)
+            dist.broadcast(thresholds_tensor, 0)
+            thresholds = thresholds_tensor.cpu().numpy()
+            
+            # Broadcast the macro_f1_opt metric too
+            macro_f1_opt_tensor = torch.tensor(val_metrics.get("macro_f1_opt", 0.0), device=device)
+            dist.broadcast(macro_f1_opt_tensor, 0)
+            val_metrics["macro_f1_opt"] = macro_f1_opt_tensor.item()
 
         # (3) SWA scheduler step
         if swa_model and epoch >= swa_start and swa_scheduler:
@@ -387,28 +509,39 @@ def main(argv: Optional[List[str]] = None):
         if args.scheduler == "plateau":
             sch.step(val_metrics["macro_f1"])
 
-        # log
-        msg = " | ".join(f"{k}:{v:.4f}" if isinstance(v, float) else f"{k}:{v}"
-                         for k, v in val_metrics.items() if not k.endswith("_precision")
-                                                                    and not k.endswith("_recall"))
-        logging.info(f"Epoch {epoch:03d} – {msg}")
+        # log (only on main process)
+        if is_main_process():
+            msg = " | ".join(f"{k}:{v:.4f}" if isinstance(v, float) else f"{k}:{v}"
+                             for k, v in val_metrics.items() if not k.endswith("_precision")
+                                                                        and not k.endswith("_recall"))
+            logging.info(f"Epoch {epoch:03d} – {msg}")
 
-        if WANDB_OK: wandb.log({"epoch": epoch, **val_metrics})
+            if WANDB_OK: wandb.log({"epoch": epoch, **val_metrics})
 
-        # (5) checkpoint & early stop
-        ckpt_path = Path(args.output) / f"epoch_{epoch}.pth"
-        torch.save({"epoch": epoch, "model": eval_model.state_dict(),
-                    "opt": opt.state_dict(), "sch": sch.state_dict(),
-                    "metrics": val_metrics, "thresholds": thresholds}, ckpt_path)
+        # (5) checkpoint & early stop (only on main process)
+        if is_main_process():
+            ckpt_path = Path(args.output) / f"epoch_{epoch}.pth"
+            torch.save({"epoch": epoch, "model": eval_model.state_dict(),
+                        "opt": opt.state_dict(), "sch": sch.state_dict(),
+                        "metrics": val_metrics, "thresholds": thresholds}, ckpt_path)
 
-        if val_metrics["macro_f1"] > best_f1:
-            best_f1, patience = val_metrics["macro_f1"], 0
-            (Path(args.output) / "best.pth").symlink_to(ckpt_path.name,
-                                                        target_is_directory=False)
-        else:
-            patience += 1
-            if patience >= args.patience:
-                logging.info("Early stopping ↑ patience exhausted")
+            if val_metrics["macro_f1"] > best_f1:
+                best_f1, patience = val_metrics["macro_f1"], 0
+                best_path = Path(args.output) / "best.pth"
+                if best_path.exists():
+                    best_path.unlink()
+                best_path.symlink_to(ckpt_path.name, target_is_directory=False)
+            else:
+                patience += 1
+                if patience >= args.patience:
+                    logging.info("Early stopping ↑ patience exhausted")
+                    break
+        
+        # Synchronize early stopping across processes
+        if world_size > 1:
+            stop_tensor = torch.tensor(patience >= args.patience, dtype=torch.bool, device=device)
+            dist.broadcast(stop_tensor, 0)
+            if stop_tensor.item():
                 break
 
     # (6) SWA batchnorm update + final eval
@@ -416,15 +549,20 @@ def main(argv: Optional[List[str]] = None):
         torch.optim.swa_utils.update_bn(tr_loader, swa_model, device=device)
         final_model = swa_model
     else:
-        final_model = ema if ema else model
+        final_model = ema if ema else model_module
 
     final_metrics, *_ = evaluate(final_model, val_loader,
                                  criterion, device, args.label_columns, thresholds)
-    logging.info("Final metrics:\n" +
-                 "\n".join(f"  {k:>15s}: {v:.4f}" for k, v in final_metrics.items()
-                           if isinstance(v, float)))
-    if WANDB_OK:
-        wandb.summary.update(final_metrics)
-        wandb.finish()
+    
+    if is_main_process():
+        logging.info("Final metrics:\n" +
+                     "\n".join(f"  {k:>15s}: {v:.4f}" for k, v in final_metrics.items()
+                               if isinstance(v, float)))
+        if WANDB_OK:
+            wandb.summary.update(final_metrics)
+            wandb.finish()
+    
+    # Cleanup distributed training
+    cleanup_distributed()
 
 if __name__ == "__main__": main()

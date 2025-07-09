@@ -164,3 +164,11 @@ make PROJECT=my_custom_name shell
 
 # Or set it permanently by editing the PROJECT variable in the Makefile
 ```
+
+## Acknowledgments
+
+Special thanks to **Merlin Authors and Code** for their contributions and inspiration in developing this foundation model training environment.
+
+## License
+
+This project is developed for research purposes in chest foundation model training.
