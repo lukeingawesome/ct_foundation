@@ -10,7 +10,7 @@ for C in "${COMBOS[@]}"; do
     --csv $DATA_CSV --pretrained $PRETRAIN_CKPT \
     --batch-size 8 --epochs 60 \
     --lr 2e-4 --lr-backbone-mult 0.1 \
-    --freeze-epochs 3 --balance-sampler --amp \
+    --balance-sampler --amp \
     $( $USE_EMA && echo "--use-ema" ) \
     $( $USE_SWA && echo "--use-swa" ) \
     --output $RUN_ROOT/S6_${C} \

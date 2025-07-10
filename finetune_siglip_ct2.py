@@ -427,22 +427,22 @@ def ddp_evaluate(model, loader, loss_fn, device, labels):
                 except ValueError:
                     auc_scores.append(0.5)
             
-            # Calculate CRG score
-            crg_metrics = calculate_crg_score(targets_np, preds_np, labels)
-            
-            # Debug information (only on rank 0)
-            if rank == 0:
-                pos_counts = targets_np.sum(axis=0)
-                pred_counts = preds_np.sum(axis=0)
-                logging.debug(f"DDP Validation: {targets_np.shape[0]} samples across all ranks")
-                logging.debug(f"DDP Positive counts per class: {pos_counts[:5]}...")
-                logging.debug(f"DDP Prediction counts per class: {pred_counts[:5]}...")
-                logging.debug(f"DDP Macro AUC: {macro_auc:.4f}, AUC scores: {[f'{a:.3f}' for a in auc_scores[:3]]}...")
-        else:
-            macro_f1 = micro_f1 = macro_auc = 0.0
-            pr = rc = f1_per_class = np.zeros(len(labels))
-            auc_scores = [0.5] * len(labels)
-            crg_metrics = {"CRG": 0.0}
+                         # Calculate CRG score
+             crg_metrics = calculate_crg_score(targets_np, preds_np, labels)
+             
+             # Debug information (only on rank 0)
+             if rank == 0:
+                 pos_counts = targets_np.sum(axis=0)
+                 pred_counts = preds_np.sum(axis=0)
+                 logging.debug(f"DDP Validation: {targets_np.shape[0]} samples across all ranks")
+                 logging.debug(f"DDP Positive counts per class: {pos_counts[:5]}...")
+                 logging.debug(f"DDP Prediction counts per class: {pred_counts[:5]}...")
+                 logging.debug(f"DDP Macro AUC: {macro_auc:.4f}, AUC scores: {[f'{a:.3f}' for a in auc_scores[:3]]}...")
+         else:
+             macro_f1 = micro_f1 = macro_auc = 0.0
+             pr = rc = f1_per_class = np.zeros(len(labels))
+             auc_scores = [0.5] * len(labels)
+             crg_metrics = {"CRG": 0.0}
     else:
         # Placeholder values for non-rank-0 processes
         macro_f1 = micro_f1 = macro_auc = 0.0
@@ -613,20 +613,20 @@ def main(argv: Optional[List[str]] = None):
     parser.add_argument("--balance-sampler", action="store_true")
     # model
     parser.add_argument("--pretrained", default="/model/1c_siglip/pytorch_model.bin")
-    parser.add_argument("--freeze-regex", default="")
+    parser.add_argument("--freeze-regex", default="", help="(UNUSED) Regex patterns for freezing parameters")
     parser.add_argument("--dropout", type=float, default=0.1)
     # optimisation
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=12)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--lr-backbone-mult", type=float, default=0.1)
+    parser.add_argument("--lr-backbone-mult", type=float, default=0.1, help="LR multiplier for backbone (discriminative LR)")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
     parser.add_argument("--scheduler", choices=["cosine", "plateau", "warmup"], default="cosine")
     parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--freeze-epochs", type=int, default=3, help="Keep backbone frozen for N epochs")
+    parser.add_argument("--freeze-epochs", type=int, default=3, help="(UNUSED) Previously kept backbone frozen for N epochs")
     # regularisation
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--use-ema", action="store_true", default=True)
@@ -729,8 +729,10 @@ def main(argv: Optional[List[str]] = None):
     # Get the actual model for parameter access (unwrap DDP if needed)
     model_module = model.module if distributed else model
 
-    freeze_regex(model_module.backbone, [s for s in args.freeze_regex.split(",") if s])
-    # param groups: backbone vs head
+    # Don't freeze anything - make everything trainable from the start
+    # freeze_regex(model_module.backbone, [s for s in args.freeze_regex.split(",") if s])
+    
+    # param groups: backbone vs head with discriminative learning rates
     param_groups = [
         {"params": [p for n, p in model_module.named_parameters()
                     if "backbone" in n and p.requires_grad],
@@ -739,6 +741,13 @@ def main(argv: Optional[List[str]] = None):
                     if "backbone" not in n and p.requires_grad],
          "lr": args.lr}
     ]
+    
+    if rank == 0:
+        backbone_params = sum(p.numel() for n, p in model_module.named_parameters() 
+                              if "backbone" in n and p.requires_grad)
+        head_params = sum(p.numel() for n, p in model_module.named_parameters() 
+                          if "backbone" not in n and p.requires_grad)
+        logging.info(f"All parameters trainable from start: backbone={backbone_params:,} (lr={args.lr * args.lr_backbone_mult}), head={head_params:,} (lr={args.lr})")
     if args.optimizer == "adamw":
         opt = AdamW(param_groups, weight_decay=args.weight_decay)
     else:
@@ -780,12 +789,12 @@ def main(argv: Optional[List[str]] = None):
         if distributed and isinstance(tr_loader.sampler, DistributedSampler):
             tr_loader.sampler.set_epoch(epoch)
         
-        # (1) freeze schedule
-        if epoch == args.freeze_epochs + 1:
-            model_module = model.module if distributed else model
-            for p in model_module.backbone.parameters(): p.requires_grad = True
-            if rank == 0:
-                logging.info("Backbone unfrozen")
+        # (1) No gradual unfreezing - everything is trainable from start
+        # if epoch == args.freeze_epochs + 1:
+        #     model_module = model.module if distributed else model
+        #     for p in model_module.backbone.parameters(): p.requires_grad = True
+        #     if rank == 0:
+        #         logging.info("Backbone unfrozen")
 
         model.train(); running = 0.
         

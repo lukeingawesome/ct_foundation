@@ -7,7 +7,7 @@ for AUG in basic strong xstrong; do
     --csv $DATA_CSV --pretrained $PRETRAIN_CKPT \
     --batch-size 8 --epochs 60 \
     --lr 2e-4 --lr-backbone-mult 0.1 \
-    --freeze-epochs 3 --balance-sampler --amp \
+    --balance-sampler --amp \
     --use-ema --use-swa \
     --output $RUN_ROOT/S4_aug_${AUG} \
     --wandb-project $WANDB_PROJECT \

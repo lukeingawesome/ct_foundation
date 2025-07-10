@@ -7,7 +7,7 @@ for FOLD in 0 1 2 3 4; do
     --pretrained $PRETRAIN_CKPT \
     --batch-size 8 --epochs 60 \
     --lr 2e-4 --lr-backbone-mult 0.1 \
-    --freeze-epochs 3 --balance-sampler --amp \
+    --balance-sampler --amp \
     --use-ema --use-swa \
     --fold $FOLD \
     --output $RUN_ROOT/S7_cv_f$FOLD \

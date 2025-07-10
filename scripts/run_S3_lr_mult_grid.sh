@@ -9,7 +9,7 @@ for LR in "${LRS[@]}"; do
       --csv $DATA_CSV --pretrained $PRETRAIN_CKPT \
       --batch-size 8 --epochs 60 \
       --lr $LR --lr-backbone-mult $M \
-      --freeze-epochs 3 --balance-sampler --amp \
+      --balance-sampler --amp \
       --use-ema --use-swa \
       --output $RUN_ROOT/S3_lr${LR}_mult${M} \
       --wandb-project $WANDB_PROJECT \

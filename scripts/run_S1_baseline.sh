@@ -8,11 +8,10 @@ torchrun --nproc_per_node=4 $PYTHON_SCRIPT \
   --epochs 60 \
   --lr 2e-4 \
   --lr-backbone-mult 0.1 \
-  --freeze-epochs 3 \
   --balance-sampler \
   --amp \
   --use-ema \
   --use-swa \
   --output $RUN_ROOT/S1_baseline \
   --wandb-project $WANDB_PROJECT \
-  --wandb-name   "${WANDB_NAME_PREFIX}_S1_baseline"
+  --wandb-name   "${WANDB_NAME_PREFIX}_S1_baseline_learning_all"

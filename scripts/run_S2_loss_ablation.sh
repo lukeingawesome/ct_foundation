@@ -7,7 +7,7 @@ for GAMMA in 1.5 2.5; do
     --batch-size 8 --epochs 60 \
     --lr 2e-4 --lr-backbone-mult 0.1 \
     --focal-gamma $GAMMA \
-    --freeze-epochs 3 --balance-sampler --amp \
+    --balance-sampler --amp \
     --use-ema --use-swa \
     --output $RUN_ROOT/S2_loss_gamma${GAMMA//./} \
     --wandb-project $WANDB_PROJECT \
