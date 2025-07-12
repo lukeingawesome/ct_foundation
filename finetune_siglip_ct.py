@@ -358,6 +358,10 @@ def ddp_evaluate(model, loader, loss_fn, device, labels):
         local_logits = torch.empty(0, len(labels))
         local_targets = torch.empty(0, len(labels))
 
+    # Move tensors to device before padding
+    local_logits = local_logits.to(device, non_blocking=True)
+    local_targets = local_targets.to(device, non_blocking=True)
+
     # Get local sizes and find max size across all ranks for padding
     local_size = torch.tensor([local_logits.shape[0]], device=device)
     all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
@@ -366,8 +370,8 @@ def ddp_evaluate(model, loader, loss_fn, device, labels):
     
     # Pad tensors to max size to ensure same shape across ranks
     if local_logits.shape[0] < max_size:
-        padding_logits = torch.zeros(max_size - local_logits.shape[0], len(labels))
-        padding_targets = torch.zeros(max_size - local_targets.shape[0], len(labels))
+        padding_logits = torch.zeros(max_size - local_size.item(), len(labels), device=device)
+        padding_targets = torch.zeros(max_size - local_size.item(), len(labels), device=device)
         local_logits = torch.cat([local_logits, padding_logits], dim=0)
         local_targets = torch.cat([local_targets, padding_targets], dim=0)
     
@@ -396,8 +400,8 @@ def ddp_evaluate(model, loader, loss_fn, device, labels):
             all_logits_combined = torch.empty(0, len(labels))
             all_targets_combined = torch.empty(0, len(labels))
         
-        logits_np = all_logits_combined.numpy()
-        targets_np = all_targets_combined.numpy()
+        logits_np = all_logits_combined.cpu().numpy()
+        targets_np = all_targets_combined.cpu().numpy()
         preds_np = (logits_np > 0.5).astype(int)
         
         # Calculate metrics with full dataset
@@ -612,7 +616,7 @@ def main(argv: Optional[List[str]] = None):
     parser.add_argument("--three-channel", action="store_true")
     parser.add_argument("--balance-sampler", action="store_true")
     # model
-    parser.add_argument("--pretrained", default="/model/1c_siglip/pytorch_model.bin")
+    parser.add_argument("--pretrained", default="/model/1c_siglip2/pytorch_model.bin")
     parser.add_argument("--freeze-regex", default="")
     parser.add_argument("--dropout", type=float, default=0.1)
     # optimisation
@@ -627,6 +631,7 @@ def main(argv: Optional[List[str]] = None):
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--freeze-epochs", type=int, default=3, help="Keep backbone frozen for N epochs")
+    parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma parameter")
     # regularisation
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--use-ema", action="store_true", default=True)
@@ -767,9 +772,11 @@ def main(argv: Optional[List[str]] = None):
             - tr_loader.dataset.df[args.label_columns].sum(0).values)
           / (tr_loader.dataset.df[args.label_columns].sum(0).values + 1e-6)),
         dtype=torch.float, device=device)
-    criterion = FocalBalancedLoss(pos_w)
+    criterion = FocalBalancedLoss(pos_w, gamma=args.focal_gamma)
+    if rank == 0:
+        logging.info(f"Using focal loss with gamma={args.focal_gamma}")
 
-    best_f1, patience = 0., 0
+    best_crg, patience = 0., 0
     thresholds = np.full(len(args.label_columns), args.threshold, dtype=np.float32)
 
     if WANDB_OK and rank == 0:
@@ -857,7 +864,7 @@ def main(argv: Optional[List[str]] = None):
 
         # Scheduler step (only rank 0 for plateau, all ranks for others)
         if args.scheduler == "plateau" and rank == 0:
-            sch.step(val_metrics["macro_f1"])
+            sch.step(val_metrics["CRG"])
 
         # Logging and tracking (only on rank 0)
         if rank == 0:
@@ -904,22 +911,32 @@ def main(argv: Optional[List[str]] = None):
         # Checkpoint saving and early stopping (only on rank 0)
         early_stop = False
         if rank == 0:
-            ckpt_path = Path(args.output) / f"epoch_{epoch}.pth"
-            torch.save({"epoch": epoch, "model": eval_model.state_dict(),
-                        "opt": opt.state_dict(), "sch": sch.state_dict(),
-                        "metrics": val_metrics, "thresholds": thresholds}, ckpt_path)
-
-            if val_metrics["macro_f1"] > best_f1:
-                best_f1, patience = val_metrics["macro_f1"], 0
-                best_path = Path(args.output) / "best.pth"
-                if best_path.exists():
-                    best_path.unlink()
-                best_path.symlink_to(ckpt_path.name, target_is_directory=False)
+            current_crg = val_metrics.get("CRG", 0.0)
+            is_last_epoch = (epoch == args.epochs)
+            
+            # Only save checkpoint if CRG improves or it's the last epoch
+            if current_crg > best_crg:
+                best_crg, patience = current_crg, 0
+                
+                # Save best CRG checkpoint
+                best_path = Path(args.output) / "best_crg.pth"
+                torch.save({"epoch": epoch, "model": eval_model.state_dict(),
+                           "opt": opt.state_dict(), "sch": sch.state_dict(),
+                           "metrics": val_metrics, "thresholds": thresholds}, best_path)
+                logging.info(f"New best CRG: {current_crg:.4f} at epoch {epoch}")
             else:
                 patience += 1
                 if patience >= args.patience:
                     logging.info("Early stopping ↑ patience exhausted")
                     early_stop = True
+            
+            # Always save last epoch checkpoint
+            if is_last_epoch or early_stop:
+                last_path = Path(args.output) / "last_epoch.pth"
+                torch.save({"epoch": epoch, "model": eval_model.state_dict(),
+                           "opt": opt.state_dict(), "sch": sch.state_dict(),
+                           "metrics": val_metrics, "thresholds": thresholds}, last_path)
+                logging.info(f"Saved last epoch checkpoint: {last_path}")
         
         # Synchronize early stopping decision across all ranks
         if distributed:

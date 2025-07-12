@@ -5,7 +5,7 @@ set -euo pipefail
 # ————————————————————————————————————————————————————
 # EDIT THESE PATHS ONCE
 export DATA_CSV="/data/all_ct_with_labels.csv"
-export PRETRAIN_CKPT="/model/1c_siglip/pytorch_model.bin"
+export PRETRAIN_CKPT="/model/1c_siglip2/pytorch_model.bin"
 export PYTHON_SCRIPT="finetune_siglip_ct.py"
 export RUN_ROOT="runs"                # all outputs will live here
 export WANDB_PROJECT="siglip-ct"
