@@ -6,6 +6,7 @@ export GID := $(shell id -g)
 export USR := $(shell whoami)
 export PROJECT ?= hanbin_fm
 export PROJECT_ROOT := /opt/project
+export COMPOSE_PROJECT_NAME := $(PROJECT)
 
 .PHONY: env build up down restart shell clean help
 
@@ -26,6 +27,7 @@ help:
 	@echo "  GID=$(GID)"
 	@echo "  USR=$(USR)"
 	@echo "  PROJECT=$(PROJECT)"
+	@echo "  COMPOSE_PROJECT_NAME=$(COMPOSE_PROJECT_NAME)"
 
 # Create .env file with current user values
 env:
@@ -41,34 +43,35 @@ env:
 	@echo "# Project configuration" >> .env
 	@echo "PROJECT=$(PROJECT)" >> .env
 	@echo "PROJECT_ROOT=$(PROJECT_ROOT)" >> .env
+	@echo "COMPOSE_PROJECT_NAME=$(COMPOSE_PROJECT_NAME)" >> .env
 	@echo "" >> .env
 	@echo ".env file created successfully!"
 	@echo "Current settings: UID=$(UID), GID=$(GID), USR=$(USR)"
 
 # Build the Docker image (automatically uses current user settings)
 build:
-	@echo "Building with UID=$(UID), GID=$(GID), USR=$(USR)"
-	@docker compose build
+	@echo "Building with UID=$(UID), GID=$(GID), USR=$(USR), PROJECT=$(PROJECT)"
+	@docker compose -p $(PROJECT) build
 
 # Start the container
 up:
-	@echo "Starting container with UID=$(UID), GID=$(GID), USR=$(USR)"
-	@docker compose up -d
+	@echo "Starting container with UID=$(UID), GID=$(GID), USR=$(USR), PROJECT=$(PROJECT)"
+	@docker compose -p $(PROJECT) up -d
 
 # Stop and remove the container
 down:
-	@docker compose down
+	@docker compose -p $(PROJECT) down
 
 # Restart the container
 restart: down up
 
 # Open a shell in the running container
 shell:
-	@docker compose exec irail /bin/bash
+	@docker compose -p $(PROJECT) exec irail /bin/bash
 
 # Remove container and image
 clean:
-	@docker compose down --rmi all --volumes --remove-orphans
+	@docker compose -p $(PROJECT) down --rmi all --volumes --remove-orphans
 
 # Force recreate .env file
 env-force:
@@ -82,4 +85,5 @@ show-env:
 	@echo "GID=$(GID)"
 	@echo "USR=$(USR)"
 	@echo "PROJECT=$(PROJECT)"
-	@echo "PROJECT_ROOT=$(PROJECT_ROOT)" 
+	@echo "PROJECT_ROOT=$(PROJECT_ROOT)"
+	@echo "COMPOSE_PROJECT_NAME=$(COMPOSE_PROJECT_NAME)" 

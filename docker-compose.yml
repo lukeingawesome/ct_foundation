@@ -11,14 +11,11 @@ services:
       args:
         UID:       ${UID:-1000}
         GID:       ${GID:-1000}
-        USERNAME:  ${USR:-user}
+        USERNAME:  ${USERNAME:-user}
         PROJECT:   ${PROJECT}
 
-    # The container will literally be named "${PROJECT}"
-    container_name: ${PROJECT}
-
-    # Fixed image name
-    image: irail:chest_fm
+    # Image name depends on PROJECT to prevent conflicts
+    image: irail:${PROJECT}
 
     # ────────────────────────────────────────
     # Runtime behaviour
