@@ -4,6 +4,7 @@
 export UID := $(shell id -u)
 export GID := $(shell id -g)
 export USR := $(shell whoami)
+export USERNAME := $(shell whoami)
 export PROJECT ?= hanbin_fm
 export PROJECT_ROOT := /opt/project
 export COMPOSE_PROJECT_NAME := $(PROJECT)
@@ -26,6 +27,7 @@ help:
 	@echo "  UID=$(UID)"
 	@echo "  GID=$(GID)"
 	@echo "  USR=$(USR)"
+	@echo "  USERNAME=$(USERNAME)"
 	@echo "  PROJECT=$(PROJECT)"
 	@echo "  COMPOSE_PROJECT_NAME=$(COMPOSE_PROJECT_NAME)"
 
@@ -39,6 +41,7 @@ env:
 	@echo "UID=$(UID)" >> .env
 	@echo "GID=$(GID)" >> .env
 	@echo "USR=$(USR)" >> .env
+	@echo "USERNAME=$(USERNAME)" >> .env
 	@echo "" >> .env
 	@echo "# Project configuration" >> .env
 	@echo "PROJECT=$(PROJECT)" >> .env
@@ -46,16 +49,16 @@ env:
 	@echo "COMPOSE_PROJECT_NAME=$(COMPOSE_PROJECT_NAME)" >> .env
 	@echo "" >> .env
 	@echo ".env file created successfully!"
-	@echo "Current settings: UID=$(UID), GID=$(GID), USR=$(USR)"
+	@echo "Current settings: UID=$(UID), GID=$(GID), USR=$(USR), USERNAME=$(USERNAME)"
 
 # Build the Docker image (automatically uses current user settings)
 build:
-	@echo "Building with UID=$(UID), GID=$(GID), USR=$(USR), PROJECT=$(PROJECT)"
+	@echo "Building with UID=$(UID), GID=$(GID), USR=$(USR), USERNAME=$(USERNAME), PROJECT=$(PROJECT)"
 	@docker compose -p $(PROJECT) build
 
 # Start the container
 up:
-	@echo "Starting container with UID=$(UID), GID=$(GID), USR=$(USR), PROJECT=$(PROJECT)"
+	@echo "Starting container with UID=$(UID), GID=$(GID), USR=$(USR), USERNAME=$(USERNAME), PROJECT=$(PROJECT)"
 	@docker compose -p $(PROJECT) up -d
 
 # Stop and remove the container
@@ -84,6 +87,7 @@ show-env:
 	@echo "UID=$(UID)"
 	@echo "GID=$(GID)"
 	@echo "USR=$(USR)"
+	@echo "USERNAME=$(USERNAME)"
 	@echo "PROJECT=$(PROJECT)"
 	@echo "PROJECT_ROOT=$(PROJECT_ROOT)"
 	@echo "COMPOSE_PROJECT_NAME=$(COMPOSE_PROJECT_NAME)" 
