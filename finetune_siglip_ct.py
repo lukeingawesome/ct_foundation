@@ -511,9 +511,9 @@ def ddp_evaluate(model, loader, loss_fn, device, labels):
 @torch.inference_mode()
 def search_thresholds(logits: np.ndarray, gts: np.ndarray,
                       step: float = 0.005) -> Tuple[np.ndarray, float]:
-    best = np.zeros(logits.shape[1]); macro = 0.
+    best = np.zeros(logits.shape[1], dtype=np.float32); macro = 0.
     for c in range(logits.shape[1]):
-        t_candidates = np.arange(0.05, 0.95, step)
+        t_candidates = np.arange(0.05, 0.95, step, dtype=np.float32)
         f1s = [f1_score(gts[:, c], (logits[:, c] > t).astype(int),
                         zero_division=0) for t in t_candidates]
         idx = int(np.argmax(f1s)); best[c] = t_candidates[idx]
@@ -848,7 +848,7 @@ def main(argv: Optional[List[str]] = None):
                 val_metrics["macro_f1_opt"] = macro_at_opt
                 
             # Broadcast thresholds from rank 0 to all ranks
-            thresholds_tensor = torch.from_numpy(thresholds).to(device)
+            thresholds_tensor = torch.from_numpy(thresholds).float().to(device)
             dist.broadcast(thresholds_tensor, src=0)
             thresholds = thresholds_tensor.cpu().numpy()
         else:
