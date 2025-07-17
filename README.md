@@ -2,6 +2,22 @@
 
 This repository contains an enhanced distributed training script for SigLIP on chest CT multilabel classification with intelligent GPU detection and allocation.
 
+## Quick Command Reference
+
+```bash
+# Most common usage - 2 GPU training
+./scripts/run_train.sh --gpus 2
+
+# Single GPU training  
+./scripts/run_train.sh --gpus 1
+
+# Multi-GPU training (4 GPUs)
+./scripts/run_train.sh --gpus 4
+
+# Show all available options
+./scripts/run_train.sh --help
+```
+
 ## Features
 
 - **Automatic GPU Detection**: Intelligently finds and allocates available GPUs based on memory usage and utilization
@@ -17,26 +33,26 @@ This repository contains an enhanced distributed training script for SigLIP on c
 
 ```bash
 # Standard 2-GPU training
-./run_stable_distributed.sh --gpus 2
+./scripts/run_train.sh --gpus 2
 
 # Single GPU training
-./run_stable_distributed.sh --gpus 1
+./scripts/run_train.sh --gpus 1
 
 # High-end 4-GPU training
-./run_stable_distributed.sh --gpus 4
+./scripts/run_train.sh --gpus 4
 ```
 
 ### Show Help
 
 ```bash
-./run_stable_distributed.sh --help
+./scripts/run_train.sh --help
 ```
 
 ## GPU Detection Logic
 
 The script automatically detects available GPUs based on three criteria:
 
-1. **Memory Usage**: GPU memory usage must be below threshold (default: 2000MB)
+1. **Memory Usage**: GPU memory usage must be below threshold (default: 10000MB)
 2. **Utilization**: GPU utilization must be below threshold (default: 10%)
 3. **Minimum Memory**: GPU must have sufficient total memory (default: 8GB)
 
@@ -48,7 +64,7 @@ The script automatically detects available GPUs based on three criteria:
 Total GPUs available: 4
 
 Checking GPU availability...
-Criteria: Memory < 2000MB, Utilization < 10%, Min Memory > 8GB
+Criteria: Memory < 10000MB, Utilization < 10%, Min Memory > 8GB
 
 GPU 0 (NVIDIA RTX 4090): 1234MB used / 24564MB total (5% util)
   ✅ GPU is available
@@ -78,7 +94,7 @@ Set CUDA_VISIBLE_DEVICES=0,2
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAX_MEMORY_MB` | 2000 | Max memory usage for 'free' GPU (MB) |
+| `MAX_MEMORY_MB` | 10000 | Max memory usage for 'free' GPU (MB) |
 | `MAX_UTILIZATION` | 10 | Max utilization for 'free' GPU (%) |
 | `MIN_MEMORY_GB` | 8 | Minimum GPU memory required (GB) |
 | `DATA_CSV` | `/data/all_ct_with_labels.csv` | Path to data CSV file |
@@ -92,7 +108,7 @@ Set CUDA_VISIBLE_DEVICES=0,2
 ### 1. Standard Multi-GPU Training
 
 ```bash
-./run_stable_distributed.sh --gpus 2
+./scripts/run_train.sh --gpus 2
 ```
 
 ### 2. Relaxed GPU Availability Criteria
@@ -104,7 +120,7 @@ export MAX_MEMORY_MB=4000     # Allow up to 4GB used
 export MAX_UTILIZATION=20     # Allow up to 20% utilization
 export MIN_MEMORY_GB=6        # Require at least 6GB memory
 
-./run_stable_distributed.sh --gpus 2
+./scripts/run_train.sh --gpus 2
 ```
 
 ### 3. Custom Data and Model Paths
@@ -114,13 +130,13 @@ export DATA_CSV="/path/to/your/data.csv"
 export PRETRAIN_CKPT="/path/to/your/model.bin"
 export OUTPUT_DIR="/path/to/output"
 
-./run_stable_distributed.sh --gpus 4
+./scripts/run_train.sh --gpus 4
 ```
 
 ### 4. Single GPU Training
 
 ```bash
-./run_stable_distributed.sh --gpus 1
+./scripts/run_train.sh --gpus 1
 ```
 
 ## Interactive Options
@@ -187,11 +203,11 @@ Example: ./run_stable_distributed.sh --gpus 2
 Check current GPU availability:
 
 ```bash
-# Run the example script to see current status
-./gpu_detect_example.sh
-
-# Or check manually
+# Check manually with nvidia-smi
 nvidia-smi
+
+# Or test the training script with dry-run
+./scripts/run_train.sh --gpus 1 --help
 ```
 
 ## Training Configuration
@@ -247,8 +263,7 @@ The output directory contains:
 ### 4. Permission Errors
 
 ```bash
-chmod +x run_stable_distributed.sh
-chmod +x gpu_detect_example.sh
+chmod +x scripts/run_train.sh
 ```
 
 ## Dependencies
@@ -278,12 +293,12 @@ Enable detailed logging:
 
 ```bash
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
-./run_stable_distributed.sh --gpus 2
+./scripts/run_train.sh --gpus 2
 ```
 
 ## Contributing
 
-To modify GPU detection logic, edit the functions in `run_stable_distributed.sh`:
+To modify GPU detection logic, edit the functions in `scripts/run_train.sh`:
 
 - `get_gpu_info()`: Get total GPU count
 - `is_gpu_available()`: Check individual GPU availability  
