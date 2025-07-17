@@ -12,6 +12,7 @@ torchrun --nproc_per_node=4 $PYTHON_SCRIPT \
   --amp \
   --use-ema \
   --use-swa \
-  --output $RUN_ROOT/S1_baseline \
+  --output $RUN_ROOT/S1_baseline_3ch \
+  --three-channel \
   --wandb-project $WANDB_PROJECT \
-  --wandb-name   "${WANDB_NAME_PREFIX}_S1_baseline_learning_all"
+  --wandb-name   "${WANDB_NAME_PREFIX}_S1_baseline_learning_all_3ch"

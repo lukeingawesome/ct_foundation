@@ -13,7 +13,6 @@ Adds:
 from __future__ import annotations
 import argparse, logging, os, random, sys, warnings, re, math, json
 import torch.distributed as dist
-from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 # test
@@ -334,39 +333,24 @@ def ddp_evaluate(model, loader, loss_fn, device, labels):
     rank = dist.get_rank()
     model.eval()
     
-    # Collect all predictions and targets with error handling
+    # Collect all predictions and targets
     all_logits = []
     all_targets = []
     tot_loss = 0.0
     total_samples = 0
 
-    try:
-        for i, (x, y) in enumerate(loader):
-            x, y = x.to(device, non_blocking=True), y.to(device)
-            try:
-                with torch.no_grad():
-                    out = model(x)
-                    logits = torch.sigmoid(out)
-                    tot_loss += loss_fn(out, y).item() * x.size(0)
-                    total_samples += x.size(0)
-                    
-                    all_logits.append(logits.cpu())
-                    all_targets.append(y.cpu())
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    logging.error(f"Rank {rank}: OOM during validation batch {i}")
-                    torch.cuda.empty_cache()
-                    # Skip this batch and continue
-                    continue
-                else:
-                    raise e
-    except Exception as e:
-        logging.error(f"Rank {rank}: Error during validation: {e}")
-        # Create empty tensors to maintain synchronization
-        all_logits = []
-        all_targets = []
+    for x, y in loader:
+        x, y = x.to(device, non_blocking=True), y.to(device)
+        with torch.no_grad():
+            out = model(x)
+            logits = torch.sigmoid(out)
+            tot_loss += loss_fn(out, y).item() * x.size(0)
+            total_samples += x.size(0)
+            
+            all_logits.append(logits.cpu())
+            all_targets.append(y.cpu())
 
-    # Gather predictions and targets from all ranks with better error handling
+    # Gather predictions and targets from all ranks
     if all_logits:
         local_logits = torch.cat(all_logits, dim=0)
         local_targets = torch.cat(all_targets, dim=0)
@@ -374,118 +358,107 @@ def ddp_evaluate(model, loader, loss_fn, device, labels):
         local_logits = torch.empty(0, len(labels))
         local_targets = torch.empty(0, len(labels))
 
-    # Move tensors to device before synchronization
+    # Move tensors to device before padding
     local_logits = local_logits.to(device, non_blocking=True)
     local_targets = local_targets.to(device, non_blocking=True)
 
-    # Simplified gathering - no complex padding logic
+    # Get local sizes and find max size across all ranks for padding
     local_size = torch.tensor([local_logits.shape[0]], device=device)
-    
-    # Gather sizes from all ranks
     all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
-    try:
-        dist.all_gather(all_sizes, local_size)
-    except RuntimeError as e:
-        logging.error(f"Rank {rank}: Error during size gathering: {e}")
-        # Fallback to local evaluation
-        return evaluate(model, loader, loss_fn, device, labels, 0.5)
-
-    total_samples_across_ranks = sum(size.item() for size in all_sizes)
+    dist.all_gather(all_sizes, local_size)
+    max_size = max(size.item() for size in all_sizes)
     
-    # Simple approach: only gather on rank 0 and broadcast results
+    # Pad tensors to max size to ensure same shape across ranks
+    if local_logits.shape[0] < max_size:
+        padding_logits = torch.zeros(max_size - local_size.item(), len(labels), device=device)
+        padding_targets = torch.zeros(max_size - local_size.item(), len(labels), device=device)
+        local_logits = torch.cat([local_logits, padding_logits], dim=0)
+        local_targets = torch.cat([local_targets, padding_targets], dim=0)
+    
+    # Gather tensors from all ranks (now all have same shape)
+    gathered_logits = [torch.zeros_like(local_logits) for _ in range(world_size)]
+    gathered_targets = [torch.zeros_like(local_targets) for _ in range(world_size)]
+    
+    dist.all_gather(gathered_logits, local_logits)
+    dist.all_gather(gathered_targets, local_targets)
+    
+    # Combine all gathered data (only on rank 0 for efficiency)
     if rank == 0:
-        # Gather all logits and targets on rank 0
-        gathered_logits = [torch.empty(size.item(), len(labels), device=device) 
-                          for size in all_sizes]
-        gathered_targets = [torch.empty(size.item(), len(labels), device=device) 
-                           for size in all_sizes]
+        # Remove padding by using actual sizes from each rank
+        all_logits_list = []
+        all_targets_list = []
+        for i, (g_logits, g_targets) in enumerate(zip(gathered_logits, gathered_targets)):
+            actual_size = all_sizes[i].item()
+            if actual_size > 0:
+                all_logits_list.append(g_logits[:actual_size])
+                all_targets_list.append(g_targets[:actual_size])
         
-        gathered_logits[0] = local_logits
-        gathered_targets[0] = local_targets
+        if all_logits_list:
+            all_logits_combined = torch.cat(all_logits_list, dim=0)
+            all_targets_combined = torch.cat(all_targets_list, dim=0)
+        else:
+            all_logits_combined = torch.empty(0, len(labels))
+            all_targets_combined = torch.empty(0, len(labels))
         
-        try:
-            # Gather from other ranks
-            for i in range(1, world_size):
-                if all_sizes[i].item() > 0:
-                    dist.recv(gathered_logits[i], src=i)
-                    dist.recv(gathered_targets[i], src=i)
+        logits_np = all_logits_combined.cpu().numpy()
+        targets_np = all_targets_combined.cpu().numpy()
+        preds_np = (logits_np > 0.5).astype(int)
+        
+        # Calculate metrics with full dataset
+        if targets_np.shape[0] > 0:
+            # Calculate F1, precision, recall with full data
+            macro_f1 = f1_score(targets_np, preds_np, average="macro", zero_division=0)
+            micro_f1 = f1_score(targets_np, preds_np, average="micro", zero_division=0)
             
-            # Combine all data
-            if total_samples_across_ranks > 0:
-                all_logits_combined = torch.cat([g for g in gathered_logits if g.shape[0] > 0], dim=0)
-                all_targets_combined = torch.cat([g for g in gathered_targets if g.shape[0] > 0], dim=0)
-                
-                logits_np = all_logits_combined.cpu().numpy()
-                targets_np = all_targets_combined.cpu().numpy()
-                preds_np = (logits_np > 0.5).astype(int)
-                
-                # Calculate metrics with full dataset
-                macro_f1 = f1_score(targets_np, preds_np, average="macro", zero_division=0)
-                micro_f1 = f1_score(targets_np, preds_np, average="micro", zero_division=0)
-                
-                # Calculate AUC scores with error handling
+            # Calculate AUC scores
+            try:
+                macro_auc = roc_auc_score(targets_np, logits_np, average="macro")
+            except ValueError:
+                macro_auc = 0.5
+            
+            # Per-class metrics
+            pr, rc, f1_per_class, _ = precision_recall_fscore_support(
+                targets_np, preds_np, average=None, zero_division=0, labels=range(len(labels)))
+            
+            auc_scores = []
+            for i in range(len(labels)):
                 try:
-                    macro_auc = roc_auc_score(targets_np, logits_np, average="macro")
+                    if len(np.unique(targets_np[:, i])) > 1:  # Check if both classes are present
+                        auc = roc_auc_score(targets_np[:, i], logits_np[:, i])
+                    else:
+                        auc = 0.5  # Default when only one class present
+                    auc_scores.append(auc)
                 except ValueError:
-                    macro_auc = 0.5
-                
-                # Per-class metrics
-                pr, rc, f1_per_class, _ = precision_recall_fscore_support(
-                    targets_np, preds_np, average=None, zero_division=0, labels=range(len(labels)))
-                
-                auc_scores = []
-                for i in range(len(labels)):
-                    try:
-                        if len(np.unique(targets_np[:, i])) > 1:
-                            auc = roc_auc_score(targets_np[:, i], logits_np[:, i])
-                        else:
-                            auc = 0.5
-                        auc_scores.append(auc)
-                    except ValueError:
-                        auc_scores.append(0.5)
-                
-                # Calculate CRG score
-                crg_metrics = calculate_crg_score(targets_np, preds_np, labels)
-            else:
-                # No data case
-                macro_f1 = micro_f1 = macro_auc = 0.0
-                pr = rc = f1_per_class = np.zeros(len(labels))
-                auc_scores = [0.5] * len(labels)
-                crg_metrics = {"CRG": 0.0}
-                logits_np = targets_np = None
-        except Exception as e:
-            logging.error(f"Rank {rank}: Error during metric calculation: {e}")
-            # Fallback values
+                    auc_scores.append(0.5)
+            
+            # Calculate CRG score
+            crg_metrics = calculate_crg_score(targets_np, preds_np, labels)
+            
+            # Debug information (only on rank 0)
+            if rank == 0:
+                pos_counts = targets_np.sum(axis=0)
+                pred_counts = preds_np.sum(axis=0)
+                logging.debug(f"DDP Validation: {targets_np.shape[0]} samples across all ranks")
+                logging.debug(f"DDP Positive counts per class: {pos_counts[:5]}...")
+                logging.debug(f"DDP Prediction counts per class: {pred_counts[:5]}...")
+                logging.debug(f"DDP Macro AUC: {macro_auc:.4f}, AUC scores: {[f'{a:.3f}' for a in auc_scores[:3]]}...")
+        else:
             macro_f1 = micro_f1 = macro_auc = 0.0
             pr = rc = f1_per_class = np.zeros(len(labels))
             auc_scores = [0.5] * len(labels)
             crg_metrics = {"CRG": 0.0}
-            logits_np = targets_np = None
     else:
-        # Send data to rank 0
-        if local_logits.shape[0] > 0:
-            try:
-                dist.send(local_logits, dst=0)
-                dist.send(local_targets, dst=0)
-            except RuntimeError as e:
-                logging.error(f"Rank {rank}: Error sending data to rank 0: {e}")
-        
         # Placeholder values for non-rank-0 processes
         macro_f1 = micro_f1 = macro_auc = 0.0
         pr = rc = f1_per_class = np.zeros(len(labels))
         auc_scores = [0.5] * len(labels)
         crg_metrics = {"CRG": 0.0}
-        logits_np = targets_np = None
 
     # Reduce loss across all processes
     total_loss_tensor = torch.tensor(tot_loss, device=device)
     total_samples_tensor = torch.tensor(total_samples, device=device)
-    
-    try:
-        dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
-    except RuntimeError as e:
-        logging.error(f"Rank {rank}: Error during loss reduction: {e}")
+    dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
     
     avg_loss = total_loss_tensor.item() / max(total_samples_tensor.item(), 1)
 
@@ -494,10 +467,7 @@ def ddp_evaluate(model, loader, loss_fn, device, labels):
         avg_loss, macro_f1, micro_f1, macro_auc, crg_metrics.get("CRG", 0.0)
     ] + list(pr) + list(rc) + list(f1_per_class) + auc_scores, device=device)
     
-    try:
-        dist.broadcast(metrics_tensor, src=0)
-    except RuntimeError as e:
-        logging.error(f"Rank {rank}: Error during metrics broadcast: {e}")
+    dist.broadcast(metrics_tensor, src=0)
     
     # Unpack broadcasted metrics
     metrics_list = metrics_tensor.cpu().tolist()
@@ -532,7 +502,10 @@ def ddp_evaluate(model, loader, loss_fn, device, labels):
         metrics[f"{name}_auc"] = auc_scores[i]
 
     # Return logits and targets from rank 0 for threshold optimization
-    return metrics, logits_np, targets_np
+    return_logits = logits_np if rank == 0 and 'logits_np' in locals() else None
+    return_targets = targets_np if rank == 0 and 'targets_np' in locals() else None
+    
+    return metrics, return_logits, return_targets
 
 # ───────────────────────────────────────────────────────
 @torch.inference_mode()
@@ -696,18 +669,9 @@ def main(argv: Optional[List[str]] = None):
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 
-    # initialise DDP with timeout
+    # initialise DDP
     if distributed and not dist.is_initialized():
-        try:
-            dist.init_process_group(
-                backend="nccl", 
-                init_method="env://",
-                timeout=timedelta(minutes=30)  # 30 minute timeout
-            )
-            logging.info(f"Rank {rank}: Successfully initialized distributed training")
-        except Exception as e:
-            logging.error(f"Rank {rank}: Failed to initialize distributed training: {e}")
-            raise e
+        dist.init_process_group(backend="nccl", init_method="env://")
     
     set_seed(42 + rank)  # Different seed per process
     
@@ -763,10 +727,9 @@ def main(argv: Optional[List[str]] = None):
     backbone = load_backbone(args.pretrained)
     model = SigLIPClassifier(backbone, len(args.label_columns), args.dropout).to(device)
     if distributed:
-        # Remove conflicting parameters and add better error handling
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.local_rank], output_device=args.local_rank,
-            find_unused_parameters=False)  # Set to False for better performance
+            find_unused_parameters=True, static_graph=True)  # Required when using frozen parameters
 
     # Get the actual model for parameter access (unwrap DDP if needed)
     model_module = model.module if distributed else model
@@ -819,18 +782,6 @@ def main(argv: Optional[List[str]] = None):
     if WANDB_OK and rank == 0:
         wandb.watch(model, log='all', log_freq=100)
 
-    # Synchronize all ranks before starting training
-    if distributed:
-        try:
-            dist.barrier(timeout=timedelta(minutes=5))
-            if rank == 0:
-                logging.info("All ranks synchronized, starting training")
-        except Exception as e:
-            logging.error(f"Rank {rank}: Failed initial barrier synchronization: {e}")
-            if distributed:
-                dist.destroy_process_group()
-            raise e
-
     # training loop ────────────────────────────────────
     for epoch in range(1, args.epochs + 1):
         if distributed and isinstance(tr_loader.sampler, DistributedSampler):
@@ -855,54 +806,21 @@ def main(argv: Optional[List[str]] = None):
         opt.zero_grad()
 
         for step, (x, y) in pbar:
-            try:
-                x, y = x.to(device, non_blocking=True), y.to(device)
-                
-                # Check GPU memory before forward pass
-                if torch.cuda.is_available() and step % 100 == 0 and rank == 0:
-                    allocated = torch.cuda.memory_allocated(device) / 1e9
-                    cached = torch.cuda.memory_reserved(device) / 1e9
-                    if allocated > 10.0:  # Log if using more than 10GB
-                        logging.debug(f"GPU memory: {allocated:.1f}GB allocated, {cached:.1f}GB cached")
-                
-                with autocast(enabled=args.amp):
-                    try:
-                        outputs = model(x)
-                        loss = criterion(outputs, y) / args.grad_accum
-                    except RuntimeError as e:
-                        if "out of memory" in str(e).lower():
-                            logging.error(f"Rank {rank}: OOM during forward pass at step {step}")
-                            torch.cuda.empty_cache()
-                            # Skip this batch and continue
-                            continue
-                        else:
-                            raise e
-                
-                scaler.scale(loss).backward()
-                running += loss.item() * args.grad_accum
+            x, y = x.to(device, non_blocking=True), y.to(device)
+            with autocast(enabled=args.amp):
+                loss = criterion(model(x), y) / args.grad_accum
+            scaler.scale(loss).backward()
+            running += loss.item() * args.grad_accum
 
-                if step % args.grad_accum == 0 or step == len(tr_loader):
-                    scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    scaler.step(opt); scaler.update(); opt.zero_grad()
-                    if ema: ema.update_parameters(model.module if distributed else model)
-                    if swa_model and epoch >= swa_start: swa_model.update_parameters(model.module if distributed else model)
-                
-                if rank == 0 and hasattr(pbar, 'set_postfix'):
-                    pbar.set_postfix(loss=f"{running/step:.4f}")
-                    
-            except Exception as e:
-                logging.error(f"Rank {rank}: Error at training step {step}: {e}")
-                # Clear GPU cache and try to continue
-                torch.cuda.empty_cache()
-                if distributed:
-                    # Force synchronization to prevent hanging
-                    try:
-                        dist.barrier(timeout=timedelta(seconds=60))
-                    except Exception:
-                        logging.error(f"Rank {rank}: Barrier timeout - rank may have failed")
-                        break
-                continue
+            if step % args.grad_accum == 0 or step == len(tr_loader):
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                scaler.step(opt); scaler.update(); opt.zero_grad()
+                if ema: ema.update_parameters(model.module if distributed else model)
+                if swa_model and epoch >= swa_start: swa_model.update_parameters(model.module if distributed else model)
+            
+            if rank == 0 and hasattr(pbar, 'set_postfix'):
+                pbar.set_postfix(loss=f"{running/step:.4f}")
 
         # scheduler step
         if args.scheduler == "plateau":
@@ -920,55 +838,25 @@ def main(argv: Optional[List[str]] = None):
         if rank == 0 and epoch <= 3 and args.debug:
             logging.info(f"Running validation for epoch {epoch} with debug info enabled...")
         
-        # Clear GPU cache before validation
-        torch.cuda.empty_cache()
-        
-        try:
-            if distributed:
-                # Use distributed evaluation on all ranks with error handling
-                val_metrics, distributed_logits, distributed_gts = ddp_evaluate(eval_model, val_loader, criterion, device, args.label_columns)
-                
-                # Only do threshold search on rank 0 using gathered data
-                if rank == 0 and distributed_logits is not None:
-                    thresholds, macro_at_opt = search_thresholds(distributed_logits, distributed_gts)
-                    val_metrics["macro_f1_opt"] = macro_at_opt
-                else:
-                    # Fallback values if distributed_logits is None
-                    if rank == 0:
-                        logging.warning("No distributed logits available for threshold search, using default")
-                    macro_at_opt = val_metrics.get("macro_f1", 0.0)
-                    val_metrics["macro_f1_opt"] = macro_at_opt
-                    
-                # Broadcast thresholds from rank 0 to all ranks
-                thresholds_tensor = torch.from_numpy(thresholds).float().to(device)
-                try:
-                    dist.broadcast(thresholds_tensor, src=0)
-                    thresholds = thresholds_tensor.cpu().numpy()
-                except RuntimeError as e:
-                    logging.error(f"Rank {rank}: Error broadcasting thresholds: {e}")
-                    # Keep using existing thresholds
-            else:
-                # Single GPU evaluation
-                val_metrics, val_logits, val_gts = evaluate(eval_model, val_loader, criterion, device,
-                                                            args.label_columns, thresholds)
-                thresholds, macro_at_opt = search_thresholds(val_logits, val_gts)
+        if distributed:
+            # Use distributed evaluation on all ranks
+            val_metrics, distributed_logits, distributed_gts = ddp_evaluate(eval_model, val_loader, criterion, device, args.label_columns)
+            
+            # Only do threshold search on rank 0 using gathered data
+            if rank == 0 and distributed_logits is not None:
+                thresholds, macro_at_opt = search_thresholds(distributed_logits, distributed_gts)
                 val_metrics["macro_f1_opt"] = macro_at_opt
-        except Exception as e:
-            logging.error(f"Rank {rank}: Validation failed at epoch {epoch}: {e}")
-            # Use fallback metrics to prevent crash
-            val_metrics = {
-                "val_loss": 999.0,
-                "macro_f1": 0.0,
-                "macro_auc": 0.0,
-                "CRG": 0.0,
-                "macro_f1_opt": 0.0
-            }
-            # Add per-class metrics with zero values
-            for label in args.label_columns:
-                val_metrics[f"{label}_precision"] = 0.0
-                val_metrics[f"{label}_recall"] = 0.0
-                val_metrics[f"{label}_f1"] = 0.0
-                val_metrics[f"{label}_auc"] = 0.0
+                
+            # Broadcast thresholds from rank 0 to all ranks
+            thresholds_tensor = torch.from_numpy(thresholds).float().to(device)
+            dist.broadcast(thresholds_tensor, src=0)
+            thresholds = thresholds_tensor.cpu().numpy()
+        else:
+            # Single GPU evaluation
+            val_metrics, val_logits, val_gts = evaluate(eval_model, val_loader, criterion, device,
+                                                        args.label_columns, thresholds)
+            thresholds, macro_at_opt = search_thresholds(val_logits, val_gts)
+            val_metrics["macro_f1_opt"] = macro_at_opt
 
         # (3) SWA scheduler step
         if swa_model and epoch >= swa_start and swa_scheduler:

@@ -1,7 +1,7 @@
 # scripts/run_S2_loss_ablation.sh   – focal‑γ grid (2 runs)
 #!/usr/bin/env bash
 source "$(dirname "$0")/env.sh"
-for GAMMA in 1.5 2.5; do
+for GAMMA in 2.5; do
   torchrun --nproc_per_node=4 $PYTHON_SCRIPT \
     --csv $DATA_CSV --pretrained $PRETRAIN_CKPT \
     --batch-size 8 --epochs 60 \
