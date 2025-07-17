@@ -651,6 +651,9 @@ def main(argv: Optional[List[str]] = None):
                         help="Fraction of training data to use for sanity testing")
     parser.add_argument("--debug", action="store_true", 
                         help="Enable debug logging for detailed AUC/metrics information")
+    parser.add_argument("--resume", type=str, default="",
+                        help="Path to a checkpoint produced by this script "
+                             "(`best_crg.pth`, `last_epoch.pth`, …).")
     args = parser.parse_args(argv)
 
     # world size / rank
@@ -782,8 +785,39 @@ def main(argv: Optional[List[str]] = None):
     if WANDB_OK and rank == 0:
         wandb.watch(model, log='all', log_freq=100)
 
+    # Resume from checkpoint if provided
+    start_epoch = 1  # default = fresh run
+    if args.resume and Path(args.resume).is_file():
+        checkpoint = torch.load(args.resume,
+                                map_location=f"cuda:{args.local_rank}")
+        # 1) model -------------------------------------------------------------
+        target = model.module if distributed else model
+        target.load_state_dict(checkpoint["model"])
+        # EMA / SWA (optional)
+        if args.use_ema and "ema" in checkpoint:
+            ema.load_state_dict(checkpoint["ema"])
+        if args.use_swa and "swa" in checkpoint:
+            swa_model.load_state_dict(checkpoint["swa"])
+
+        # 2) optimisation ------------------------------------------------------
+        opt.load_state_dict(checkpoint["opt"])
+        sch.load_state_dict(checkpoint["sch"])
+        scaler.load_state_dict(checkpoint["scaler"])
+
+        # 3) bookkeeping -------------------------------------------------------
+        thresholds = checkpoint.get("thresholds", thresholds)
+        best_crg   = checkpoint.get("best_crg", 0.0)
+        patience   = checkpoint.get("patience", 0)
+
+        start_epoch = checkpoint["epoch"] + 1    # resume *after* the stored epoch
+        if is_main_process():
+            logging.info(f"▶ Resumed from {args.resume} @ epoch {start_epoch}")
+    else:
+        if is_main_process() and args.resume:
+            logging.warning(f"--resume={args.resume} not found. Starting fresh.")
+
     # training loop ────────────────────────────────────
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         if distributed and isinstance(tr_loader.sampler, DistributedSampler):
             tr_loader.sampler.set_epoch(epoch)
         
@@ -920,9 +954,20 @@ def main(argv: Optional[List[str]] = None):
                 
                 # Save best CRG checkpoint
                 best_path = Path(args.output) / "best_crg.pth"
-                torch.save({"epoch": epoch, "model": eval_model.state_dict(),
-                           "opt": opt.state_dict(), "sch": sch.state_dict(),
-                           "metrics": val_metrics, "thresholds": thresholds}, best_path)
+                ckpt = {
+                    "epoch":       epoch,
+                    "model":       eval_model.state_dict(),
+                    "opt":         opt.state_dict(),
+                    "sch":         sch.state_dict(),
+                    "scaler":      scaler.state_dict(),
+                    "thresholds":  thresholds,
+                    "best_crg":    best_crg,
+                    "patience":    patience,
+                    "metrics":     val_metrics,
+                }
+                if ema: ckpt["ema"] = ema.state_dict()
+                if swa_model: ckpt["swa"] = swa_model.state_dict()
+                torch.save(ckpt, best_path)
                 logging.info(f"New best CRG: {current_crg:.4f} at epoch {epoch}")
             else:
                 patience += 1
@@ -933,9 +978,20 @@ def main(argv: Optional[List[str]] = None):
             # Always save last epoch checkpoint
             if is_last_epoch or early_stop:
                 last_path = Path(args.output) / "last_epoch.pth"
-                torch.save({"epoch": epoch, "model": eval_model.state_dict(),
-                           "opt": opt.state_dict(), "sch": sch.state_dict(),
-                           "metrics": val_metrics, "thresholds": thresholds}, last_path)
+                ckpt = {
+                    "epoch":       epoch,
+                    "model":       eval_model.state_dict(),
+                    "opt":         opt.state_dict(),
+                    "sch":         sch.state_dict(),
+                    "scaler":      scaler.state_dict(),
+                    "thresholds":  thresholds,
+                    "best_crg":    best_crg,
+                    "patience":    patience,
+                    "metrics":     val_metrics,
+                }
+                if ema: ckpt["ema"] = ema.state_dict()
+                if swa_model: ckpt["swa"] = swa_model.state_dict()
+                torch.save(ckpt, last_path)
                 logging.info(f"Saved last epoch checkpoint: {last_path}")
         
         # Synchronize early stopping decision across all ranks
