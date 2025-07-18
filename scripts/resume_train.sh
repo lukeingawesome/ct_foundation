@@ -59,7 +59,7 @@ echo "[INFO] nproc_per_node set to ${REQ_GPUS}"
 
 # ------------------------------ launch ----------------------------------------
 # Check for existing checkpoint to resume from
-LAST_CKPT="$RUN_ROOT/S1_baseline_3ch/last_epoch.pth"
+LAST_CKPT="$RUN_ROOT/S1_baseline_3ch/best_crg.pth"
 [[ -f "$LAST_CKPT" ]] && RESUME="--resume $LAST_CKPT" || RESUME=""
 
 echo "[INFO] Checkpoint path: ${LAST_CKPT}"

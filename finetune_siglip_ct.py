@@ -240,7 +240,7 @@ def make_loaders(csv: str, labels: List[str], bs: int, nw: int, three_ch: bool,
 def load_backbone(ckpt: str) -> Merlin:
     model = Merlin(ImageEmbedding=True)
     if ckpt and Path(ckpt).is_file():
-        sd = torch.load(ckpt, map_location="cpu")
+        sd = torch.load(ckpt, map_location="cpu", weights_only=False)
         model.load_state_dict({k[7:]: v for k, v in sd.items()
                                if k.startswith("visual.")}, strict=False)
         logging.info(f"Loaded SigLIP visual weights ↗ {ckpt}")
@@ -789,15 +789,83 @@ def main(argv: Optional[List[str]] = None):
     start_epoch = 1  # default = fresh run
     if args.resume and Path(args.resume).is_file():
         checkpoint = torch.load(args.resume,
-                                map_location=f"cuda:{args.local_rank}")
+                                map_location=f"cuda:{args.local_rank}",
+                                weights_only=False)
         # 1) model -------------------------------------------------------------
         target = model.module if distributed else model
-        target.load_state_dict(checkpoint["model"])
-        # EMA / SWA (optional)
-        if args.use_ema and "ema" in checkpoint:
-            ema.load_state_dict(checkpoint["ema"])
-        if args.use_swa and "swa" in checkpoint:
-            swa_model.load_state_dict(checkpoint["swa"])
+        
+        # Handle DDP checkpoint compatibility
+        checkpoint_state = checkpoint["model"]
+        model_state = target.state_dict()
+        
+        # Check if checkpoint has DDP prefixes but current model doesn't (or vice versa)
+        checkpoint_has_module = any(k.startswith("module.") for k in checkpoint_state.keys())
+        model_has_module = any(k.startswith("module.") for k in model_state.keys())
+        
+        if checkpoint_has_module and not model_has_module:
+            # Remove "module." prefix from checkpoint
+            checkpoint_state = {k[7:] if k.startswith("module.") else k: v 
+                              for k, v in checkpoint_state.items()}
+            if is_main_process():
+                logging.info("Removed 'module.' prefixes from checkpoint for compatibility")
+        elif not checkpoint_has_module and model_has_module:
+            # Add "module." prefix to checkpoint
+            checkpoint_state = {f"module.{k}": v for k, v in checkpoint_state.items()}
+            if is_main_process():
+                logging.info("Added 'module.' prefixes to checkpoint for compatibility")
+        
+        # Filter out keys that don't match (e.g., different model architecture)
+        filtered_state = {}
+        for k, v in checkpoint_state.items():
+            if k in model_state:
+                if v.shape == model_state[k].shape:
+                    filtered_state[k] = v
+                else:
+                    if is_main_process():
+                        logging.warning(f"Shape mismatch for {k}: checkpoint {v.shape} vs model {model_state[k].shape}")
+            else:
+                if is_main_process() and args.debug:
+                    logging.debug(f"Skipping unmatched key: {k}")
+        
+        # Load the compatible state dict
+        missing_keys, unexpected_keys = target.load_state_dict(filtered_state, strict=False)
+        
+        if is_main_process():
+            if missing_keys:
+                logging.info(f"Missing keys in checkpoint: {len(missing_keys)} (model has new parameters)")
+                if args.debug:
+                    logging.debug(f"Missing keys: {missing_keys[:10]}{'...' if len(missing_keys) > 10 else ''}")
+            if unexpected_keys:
+                logging.info(f"Unexpected keys in checkpoint: {len(unexpected_keys)} (checkpoint has extra parameters)")
+                if args.debug:
+                    logging.debug(f"Unexpected keys: {unexpected_keys[:10]}{'...' if len(unexpected_keys) > 10 else ''}")
+            logging.info(f"Successfully loaded {len(filtered_state)} parameters from checkpoint")
+        # EMA / SWA (optional) with compatibility handling
+        if args.use_ema and "ema" in checkpoint and ema is not None:
+            ema_state = checkpoint["ema"]
+            # Handle DDP compatibility for EMA
+            if checkpoint_has_module and not model_has_module:
+                ema_state = {k[7:] if k.startswith("module.") else k: v 
+                           for k, v in ema_state.items() if k != "n_averaged"}
+            elif not checkpoint_has_module and model_has_module:
+                ema_state = {f"module.{k}" if k != "n_averaged" else k: v 
+                           for k, v in ema_state.items()}
+            ema.load_state_dict(ema_state, strict=False)
+            if is_main_process():
+                logging.info("Loaded EMA state from checkpoint")
+                
+        if args.use_swa and "swa" in checkpoint and swa_model is not None:
+            swa_state = checkpoint["swa"] 
+            # Handle DDP compatibility for SWA
+            if checkpoint_has_module and not model_has_module:
+                swa_state = {k[7:] if k.startswith("module.") else k: v 
+                           for k, v in swa_state.items() if k != "n_averaged"}
+            elif not checkpoint_has_module and model_has_module:
+                swa_state = {f"module.{k}" if k != "n_averaged" else k: v 
+                           for k, v in swa_state.items()}
+            swa_model.load_state_dict(swa_state, strict=False)
+            if is_main_process():
+                logging.info("Loaded SWA state from checkpoint")
 
         # 2) optimisation ------------------------------------------------------
         opt.load_state_dict(checkpoint["opt"])
@@ -946,9 +1014,8 @@ def main(argv: Optional[List[str]] = None):
         early_stop = False
         if rank == 0:
             current_crg = val_metrics.get("CRG", 0.0)
-            is_last_epoch = (epoch == args.epochs)
             
-            # Only save checkpoint if CRG improves or it's the last epoch
+            # Save best CRG checkpoint if improved
             if current_crg > best_crg:
                 best_crg, patience = current_crg, 0
                 
@@ -975,24 +1042,23 @@ def main(argv: Optional[List[str]] = None):
                     logging.info("Early stopping ↑ patience exhausted")
                     early_stop = True
             
-            # Always save last epoch checkpoint
-            if is_last_epoch or early_stop:
-                last_path = Path(args.output) / "last_epoch.pth"
-                ckpt = {
-                    "epoch":       epoch,
-                    "model":       eval_model.state_dict(),
-                    "opt":         opt.state_dict(),
-                    "sch":         sch.state_dict(),
-                    "scaler":      scaler.state_dict(),
-                    "thresholds":  thresholds,
-                    "best_crg":    best_crg,
-                    "patience":    patience,
-                    "metrics":     val_metrics,
-                }
-                if ema: ckpt["ema"] = ema.state_dict()
-                if swa_model: ckpt["swa"] = swa_model.state_dict()
-                torch.save(ckpt, last_path)
-                logging.info(f"Saved last epoch checkpoint: {last_path}")
+            # Always save last epoch checkpoint (every epoch for resumability)
+            last_path = Path(args.output) / "last_epoch.pth"
+            ckpt = {
+                "epoch":       epoch,
+                "model":       eval_model.state_dict(),
+                "opt":         opt.state_dict(),
+                "sch":         sch.state_dict(),
+                "scaler":      scaler.state_dict(),
+                "thresholds":  thresholds,
+                "best_crg":    best_crg,
+                "patience":    patience,
+                "metrics":     val_metrics,
+            }
+            if ema: ckpt["ema"] = ema.state_dict()
+            if swa_model: ckpt["swa"] = swa_model.state_dict()
+            torch.save(ckpt, last_path)
+            logging.info(f"Saved checkpoint: {last_path} (epoch {epoch})")
         
         # Synchronize early stopping decision across all ranks
         if distributed:
