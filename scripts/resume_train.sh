@@ -19,10 +19,17 @@ discover_free_gpus () {
 read -ra FREE_GPUS <<< "$(discover_free_gpus)"
 FREE_COUNT="${#FREE_GPUS[@]}"
 
-# If user didn’t specify a number, take everything we found
+# DEBUG: Show what GPUs were discovered
+echo "[DEBUG] Memory threshold: ${MEM_THRESHOLD} MiB"
+echo "[DEBUG] Free GPUs discovered: ${FREE_GPUS[*]}"
+echo "[DEBUG] Free GPU count: ${FREE_COUNT}"
+
+# If user didn't specify a number, take everything we found
 if [[ "$REQ_GPUS" -eq 0 ]]; then
     REQ_GPUS="$FREE_COUNT"
 fi
+
+echo "[DEBUG] Requested GPUs: ${REQ_GPUS}"
 
 # Sanity checks ----------------------------------------------------------------
 if [[ "$FREE_COUNT" -eq 0 ]]; then
@@ -40,20 +47,36 @@ fi
 # Pick the first $REQ_GPUS from FREE_GPUS and export CUDA_VISIBLE_DEVICES
 SELECTED_GPU_LIST="$(printf "%s," "${FREE_GPUS[@]:0:REQ_GPUS}")"
 CUDA_VISIBLE_DEVICES="${SELECTED_GPU_LIST%,}"   # strip trailing comma
+
+# DEBUG: Show final selection
+echo "[DEBUG] Selected GPU list: ${SELECTED_GPU_LIST}"
+echo "[DEBUG] Final CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+
 export CUDA_VISIBLE_DEVICES
 
 echo "[INFO] Using GPU(s): ${CUDA_VISIBLE_DEVICES}"
 echo "[INFO] nproc_per_node set to ${REQ_GPUS}"
 
 # ------------------------------ launch ----------------------------------------
+# Check for existing checkpoint to resume from
+LAST_CKPT="$RUN_ROOT/S1_baseline_3ch/last_epoch.pth"
+[[ -f "$LAST_CKPT" ]] && RESUME="--resume $LAST_CKPT" || RESUME=""
+
+echo "[INFO] Checkpoint path: ${LAST_CKPT}"
+if [[ -n "$RESUME" ]]; then
+    echo "[INFO] Found existing checkpoint, will resume training"
+else
+    echo "[INFO] No existing checkpoint found, starting fresh training"
+fi
+
 torchrun --nproc_per_node="${REQ_GPUS}" $PYTHON_SCRIPT \
   --csv "$DATA_CSV" \
   --pretrained "$PRETRAIN_CKPT" \
+  $RESUME \
   --batch-size 8 \
   --epochs 60 \
   --lr 2e-4 \
   --lr-backbone-mult 0.1 \
-  --focal-gamma 0.0 \
   --balance-sampler \
   --amp \
   --use-ema \
