@@ -71,5 +71,6 @@ torchrun --nproc_per_node="${REQ_GPUS}" $PYTHON_SCRIPT \
   --use-swa \
   --output "$RUN_ROOT/S1_baseline_3ch" \
   --three-channel \
+  --focal-gamma 0 \
   --wandb-project "$WANDB_PROJECT" \
-  --wandb-name   "${WANDB_NAME_PREFIX}_S1_baseline_learning_all_3ch"
+  --wandb-name   "${WANDB_NAME_PREFIX}_S1_baseline_learning_all_3ch_nogamma"

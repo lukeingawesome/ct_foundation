@@ -12,6 +12,7 @@ Transforms: re‑use get_train_transform / get_val_transform from your code.
 """
 
 import argparse, os, math, random, json, logging, torch, gc
+import torch.distributed as dist
 from pathlib import Path
 from typing import List
 import torch.nn as nn
@@ -20,9 +21,10 @@ from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM, 
     get_cosine_schedule_with_warmup, 
-    AdamW, set_seed
+    set_seed
 )
-os.environ["HF_HOME"] = "/model/huggingface"
+from torch.optim import AdamW
+from tqdm import tqdm
 
 # ------------------------------------------------------------
 #  YOUR own modules
@@ -31,8 +33,8 @@ os.environ["HF_HOME"] = "/model/huggingface"
 #    * get_train_transform ..... from ct_transform.py
 # ------------------------------------------------------------
 from merlin import Merlin
-from dataloader import CustomCSVDataset, _hu_window_to_unit          # your file
-from ct_transform import get_train_transform, get_val_transform      # your file
+from training.data import CustomCSVDataset, _hu_window_to_unit          # your file
+from training.ct_transform import get_train_transform, get_val_transform      # your file
 # ------------------------------------------------------------
 
 def mean_pool_hidden(hidden, attention_mask):
@@ -82,14 +84,14 @@ class CTProjector(nn.Module):
         return img_emb, x                    # (for Stage ②)
 
 # -------------------------------------------------------------------------
-def build_dataloaders(csv_path: str, tokenizer, batch_size=8, workers=4):
+def build_dataloaders(csv_path: str, tokenizer, batch_size=8, workers=4, three_ch=False):
     tr_ds = CustomCSVDataset(
         csv_file=csv_path,
         transform=get_train_transform(),
         img_key="img_path", caption_key="findings",
         tokenizer=None, is_train=True,
         dataset_mode="ct", split="train", split_column="split",
-        use_3channel=False
+        use_3channel=three_ch
     )
     val_ds = CustomCSVDataset(
         csv_file=csv_path,
@@ -97,7 +99,7 @@ def build_dataloaders(csv_path: str, tokenizer, batch_size=8, workers=4):
         img_key="img_path", caption_key="findings",
         tokenizer=None, is_train=False,
         dataset_mode="ct", split="val", split_column="split",
-        use_3channel=False
+        use_3channel=three_ch
     )
 
     def collate(batch):
@@ -129,15 +131,27 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--wd", type=float, default=1e-2)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--three_ch", action="store_true")
     args = parser.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s | %(levelname)s | %(message)s")
+    ###############################################
+    # DDP initialisation
+    distributed = "RANK" in os.environ
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    set_seed(42)
+    if distributed:
+        torch.cuda.set_device(local_rank)      # unique GPU per rank
+        dist.init_process_group(backend="nccl")
+    device = torch.device(f"cuda:{local_rank}") if distributed else torch.device("cuda")
+    rank0 = (not distributed) or dist.get_rank() == 0
+    ###############################################
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if rank0:
+        os.makedirs(args.out_dir, exist_ok=True)
+        logging.basicConfig(level=logging.INFO,
+                            format="%(asctime)s | %(levelname)s | %(message)s")
+
+    set_seed(42 + (dist.get_rank() if distributed else 0))
 
     # ---------- Load frozen CT encoder -------------------------------------
     ct_encoder = Merlin(ImageEmbedding=True)                  # your class
@@ -149,21 +163,92 @@ def main():
     feat_dim = getattr(ct_encoder, "output_dim", 2048)
 
     # ---------- Load Gemma tokenizer / model ( text side is frozen) --------
-    tokenizer = AutoTokenizer.from_pretrained(args.gemma_id)
+    token = os.getenv("HUGGINGFACE_HUB_TOKEN")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.gemma_id, token=token)
+
     gemma = AutoModelForCausalLM.from_pretrained(
-        args.gemma_id, device_map="auto", torch_dtype=torch.bfloat16
+        args.gemma_id,
+        token=token,
+        device_map={"": f"cuda:{local_rank}"},         # pin Gemma to this GPU
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True
     )
-    hidden_dim = gemma.config.hidden_size
+    # Gemma3Config does not have `.hidden_size`.
+    # Use the real embedding matrix instead (works for every model version).
+    hidden_dim = gemma.get_input_embeddings().weight.shape[1]
     for p in gemma.parameters():
         p.requires_grad = False
     gemma.eval()
 
     # ---------- Projector to train -----------------------------------------
     projector = CTProjector(feat_dim, hidden_dim).to(device)
+    if distributed:
+        projector = torch.nn.parallel.DistributedDataParallel(
+            projector,
+            device_ids=[local_rank],            # explicit is safer
+            output_device=local_rank
+        )
 
     # ---------- Dataloaders ------------------------------------------------
-    tr_loader, val_loader = build_dataloaders(args.csv, tokenizer,
-                                              batch_size=args.bs, workers=args.workers)
+    tr_ds = CustomCSVDataset(
+        csv_file=args.csv,
+        transform=get_train_transform(),
+        img_key="img_path", caption_key="findings",
+        tokenizer=None, is_train=True,
+        dataset_mode="ct", split="train", split_column="split",
+        use_3channel=args.three_ch
+    )
+    val_ds = CustomCSVDataset(
+        csv_file=args.csv,
+        transform=get_val_transform(),
+        img_key="img_path", caption_key="findings",
+        tokenizer=None, is_train=False,
+        dataset_mode="ct", split="val", split_column="split",
+        use_3channel=args.three_ch
+    )
+
+    def collate(batch):
+        imgs, caps = zip(*batch)
+        
+        # Handle variable-sized tensors by finding max dimensions
+        if len(imgs) > 0:
+            # Get all shapes and find maximum dimensions
+            shapes = [img.shape for img in imgs]
+            max_shape = [max(dim) for dim in zip(*shapes)]
+            
+            # Pad all tensors to max_shape if needed
+            padded_imgs = []
+            for img in imgs:
+                if img.shape != tuple(max_shape):
+                    # Create padding for each dimension
+                    padding = []
+                    for i in range(len(img.shape)-1, -1, -1):  # reverse order for F.pad
+                        pad_size = max_shape[i] - img.shape[i]
+                        padding.extend([0, pad_size])
+                    img = F.pad(img, padding, mode='constant', value=0)
+                padded_imgs.append(img)
+            imgs = torch.stack(padded_imgs)
+        else:
+            imgs = torch.stack(imgs)
+            
+        tok = tokenizer(
+            list(caps), padding=True, truncation=True,
+            max_length=128, return_tensors="pt"
+        )
+        return imgs, tok["input_ids"], tok["attention_mask"]
+
+    from torch.utils.data.distributed import DistributedSampler
+    tr_sampler = DistributedSampler(tr_ds) if distributed else None
+    val_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else None
+    tr_loader = DataLoader(
+        tr_ds, batch_size=args.bs, shuffle=(tr_sampler is None),
+        sampler=tr_sampler, num_workers=args.workers, pin_memory=True, collate_fn=collate
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.bs, shuffle=False,
+        sampler=val_sampler, num_workers=args.workers, pin_memory=True, collate_fn=collate
+    )
 
     # ---------- Optim & sched ---------------------------------------------
     opt = AdamW(projector.parameters(), lr=args.lr, weight_decay=args.wd)
@@ -176,14 +261,21 @@ def main():
 
     def encode_text(input_ids, attn_mask):
         with torch.no_grad():
-            out = gemma.model.embed_tokens(input_ids.to(device))       # (B,L,H)
+            out = gemma.get_input_embeddings()(input_ids.to(device))  # (B, L, H)
             txt_emb = mean_pool_hidden(out, attn_mask.to(device))
             return F.normalize(txt_emb, dim=-1)
 
     for epoch in range(1, args.epochs + 1):
+        if distributed: 
+            tr_loader.sampler.set_epoch(epoch)
         projector.train()
         total_loss = 0.0
-        for imgs, ids, mask in tr_loader:
+        
+        # Training progress bar (only on rank 0)
+        train_bar = tqdm(tr_loader, desc=f"Epoch {epoch}/{args.epochs}", 
+                        disable=not rank0, leave=False)
+        
+        for imgs, ids, mask in train_bar:
             imgs = imgs.to(device, non_blocking=True)
             with torch.no_grad():
                 feats = ct_encoder(imgs)                 # (B, feat_dim) or (B,N,C)
@@ -203,15 +295,25 @@ def main():
             opt.step(); sched.step()
 
             total_loss += loss.item()
+            
+            # Update progress bar with current loss
+            if rank0:
+                train_bar.set_postfix({'loss': f'{loss.item():.4f}'})
 
         avg = total_loss / len(tr_loader)
-        logging.info(f"Epoch {epoch:02d}  train_loss={avg:.4f}")
+        if rank0:
+            logging.info(f"Epoch {epoch:02d}  train_loss={avg:.4f}")
 
         # ---------- quick val retrieval recall@1 -----------------------
         projector.eval()
         sims, correct = 0, 0
+        
+        # Validation progress bar (only on rank 0)
+        val_bar = tqdm(val_loader, desc="Validation", 
+                      disable=not rank0, leave=False)
+        
         with torch.no_grad():
-            for imgs, ids, mask in val_loader:
+            for imgs, ids, mask in val_bar:
                 imgs = imgs.to(device); feats = ct_encoder(imgs)
                 img_emb, _ = projector(feats)
                 txt_emb = encode_text(ids, mask)
@@ -219,13 +321,22 @@ def main():
                 sims += sim.numel()
                 correct += (sim.argmax(dim=0) == 0).sum().item()   # recall@1
 
-        r1 = correct / sims
-        logging.info(f"           val_recall@1 = {r1:.3%}")
+        if distributed:
+            total_corr = torch.tensor(correct, device=device)
+            total_sims = torch.tensor(sims,    device=device)
+            dist.all_reduce(total_corr, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_sims, op=dist.ReduceOp.SUM)
+            r1 = (total_corr / total_sims).item()
+        else:
+            r1 = correct / sims
+        if rank0:
+            logging.info(f"           val_recall@1 = {r1:.3%}")
 
         # ---------- save best ------------------------------------------
-        if r1 > best_val:
+        if rank0 and r1 > best_val:
             best_val = r1
-            torch.save({"projector": projector.state_dict(),
+            model_state = projector.module.state_dict() if distributed else projector.state_dict()
+            torch.save({"projector": model_state,
                         "epoch": epoch,
                         "feat_dim": feat_dim,
                         "hidden_dim": hidden_dim},
@@ -233,7 +344,11 @@ def main():
             logging.info("           ✓  saved new best")
 
     # ---------------------------------------------------------------------
-    logging.info(f"Done.  Best val recall@1 = {best_val:.3%}")
+    if rank0:
+        logging.info(f"Done.  Best val recall@1 = {best_val:.3%}")
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
     gc.collect(); torch.cuda.empty_cache()
 
 if __name__ == "__main__":
