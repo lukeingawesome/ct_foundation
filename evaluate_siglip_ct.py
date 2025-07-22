@@ -147,17 +147,14 @@ def search_thresholds(logits: np.ndarray, gts: np.ndarray, step: float = 0.005) 
 
 # ───────────────────────────────────────────────────────
 @torch.inference_mode()
-def evaluate(model, loader, device, labels, thresholds, loss_fn=None):
+def evaluate(model, loader, device, labels, thresholds):
     """Evaluate model on validation set."""
     model.eval()
     logits, gts = [], []
-    tot_loss = 0.0
     
     for x, y in loader:
         x, y = x.to(device, non_blocking=True), y.to(device)
         out = model(x)
-        if loss_fn is not None:
-            tot_loss += loss_fn(out, y).item()
         logits.append(torch.sigmoid(out).cpu())
         gts.append(y.cpu())
     
@@ -342,21 +339,9 @@ def main():
     
     logging.info(f"Validation set: {len(val_dataset)} samples")
     
-    # Create the same loss function used during training validation
-    # Calculate pos_weight from training data (same as in training)
-    train_df = pd.read_csv(args.csv).query("split=='train'")
-    pos_w = torch.tensor(
-        ((train_df.shape[0] - train_df[args.label_columns].sum(0).values)
-         / (train_df[args.label_columns].sum(0).values + 1e-6)),
-        dtype=torch.float, device=device)
-    
-    # Create focal loss with gamma=1.5 (from S2_loss_gamma15 checkpoint name)
-    focal_gamma = 1.5  # Inferred from checkpoint path "S2_loss_gamma15"
-    criterion = FocalBalancedLoss(pos_w, gamma=focal_gamma)
-    
     # Evaluate with saved thresholds
     logging.info("Evaluating with saved thresholds...")
-    metrics, logits, gts = evaluate(model, val_loader, device, args.label_columns, saved_thresholds, criterion)
+    metrics, logits, gts = evaluate(model, val_loader, device, args.label_columns, saved_thresholds)
     
     # Print results
     print("\n" + "="*80)
@@ -395,7 +380,7 @@ def main():
         optimal_thresholds, macro_f1_opt = search_thresholds(logits, gts)
         
         # Evaluate with optimal thresholds
-        metrics_opt, _, _ = evaluate(model, val_loader, device, args.label_columns, optimal_thresholds, criterion)
+        metrics_opt, _, _ = evaluate(model, val_loader, device, args.label_columns, optimal_thresholds)
         
         print("\n" + "="*80)
         print("EVALUATION RESULTS WITH OPTIMIZED THRESHOLDS")

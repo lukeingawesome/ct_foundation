@@ -59,7 +59,7 @@ echo "[INFO] nproc_per_node set to ${REQ_GPUS}"
 
 # ------------------------------ launch ----------------------------------------
 # Check for existing checkpoint to resume from
-LAST_CKPT="$RUN_ROOT/S1_baseline_3ch/best_crg.pth"
+LAST_CKPT="$RUN_ROOT/S1_baseline_3ch/last_epoch.pth"
 [[ -f "$LAST_CKPT" ]] && RESUME="--resume $LAST_CKPT" || RESUME=""
 
 echo "[INFO] Checkpoint path: ${LAST_CKPT}"
@@ -81,6 +81,7 @@ torchrun --nproc_per_node="${REQ_GPUS}" $PYTHON_SCRIPT \
   --amp \
   --use-ema \
   --use-swa \
+  --focal-gamma 0.0 \
   --output "$RUN_ROOT/S1_baseline_3ch" \
   --three-channel \
   --wandb-project "$WANDB_PROJECT" \
