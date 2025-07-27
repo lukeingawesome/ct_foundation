@@ -83,4 +83,5 @@ bandit-report.txt
 tests/temp_*
 tests/fixtures/temp_*
 llm/*
-pack/
+pack/*
+pack/train_medgemma_stage1.py

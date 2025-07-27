@@ -107,7 +107,7 @@ def build_dataloaders(csv_path: str, tokenizer, batch_size=8, workers=4, three_c
         imgs = torch.stack(imgs)
         tok = tokenizer(
             list(caps), padding=True, truncation=True,
-            max_length=128, return_tensors="pt"
+            max_length=1024, return_tensors="pt"
         )
         return imgs, tok["input_ids"], tok["attention_mask"]
 
@@ -234,7 +234,7 @@ def main():
             
         tok = tokenizer(
             list(caps), padding=True, truncation=True,
-            max_length=128, return_tensors="pt"
+            max_length=1024, return_tensors="pt"
         )
         return imgs, tok["input_ids"], tok["attention_mask"]
 
