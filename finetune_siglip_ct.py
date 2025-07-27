@@ -522,10 +522,11 @@ def search_thresholds(logits: np.ndarray, gts: np.ndarray,
 
 # ───────────────────────────────────────────────────────
 def evaluate(model, loader, loss_fn, device, labels,
-             thresholds: np.ndarray | float):
+             thresholds: np.ndarray | float, show_tqdm=False):
     model.eval(); tot_loss, logits, gts = 0., [], []
+    iterator = loader if not show_tqdm else tqdm(loader, desc="val", ncols=80)
     with torch.no_grad():
-        for x, y in loader:
+        for x, y in iterator:
             x, y = x.to(device, non_blocking=True), y.to(device)
             out = model(x); tot_loss += loss_fn(out, y).item()
             logits.append(torch.sigmoid(out).cpu()); gts.append(y.cpu())

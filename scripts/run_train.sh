@@ -62,15 +62,14 @@ torchrun --nproc_per_node="${REQ_GPUS}" $PYTHON_SCRIPT \
   --csv "$DATA_CSV" \
   --pretrained "$PRETRAIN_CKPT" \
   --batch-size 8 \
-  --epochs 60 \
+  --epochs 40 \
   --lr 2e-4 \
   --lr-backbone-mult 0.1 \
   --balance-sampler \
   --amp \
   --use-ema \
-  --use-swa \
-  --output "$RUN_ROOT/S1_baseline_3ch" \
-  --three-channel \
-  --focal-gamma 0 \
+  --balance-sampler \
+  --output "$RUN_ROOT/S5_balancesampler_nofocal_noswa_1c" \
+  --focal-gamma 0.0 \
   --wandb-project "$WANDB_PROJECT" \
-  --wandb-name   "${WANDB_NAME_PREFIX}_S1_baseline_learning_all_3ch_nogamma"
+  --wandb-name   "${WANDB_NAME_PREFIX}_S5_nofocal__noswa_balancesampler_1c"

@@ -82,4 +82,5 @@ bandit-report.txt
 # Temporary test files
 tests/temp_*
 tests/fixtures/temp_*
-llm/
+llm/*
+pack/

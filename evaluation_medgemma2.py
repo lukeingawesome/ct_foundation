@@ -87,18 +87,19 @@ def collate(batch, processor):
     imgs   = [b["img"]   for b in batch]
     instrs = [b["instr"] for b in batch]
 
-    # message list per sample
+    # user message  ➜  <task=report>  <image>  instruction
     msgs = [[{"role":"user",
               "content":[{"type":"text","text":"<task=report>"},
-                         {"type":"text","text":instrs[i]},
-                         {"type":"image"}]}] for i in range(len(batch))]
+                         {"type":"image"},
+                         {"type":"text","text":instrs[i]}]}]
+            for i in range(len(batch))]
 
     prompts = [processor.apply_chat_template(m, add_generation_prompt=True,
                                              tokenize=False).strip()
                for m in msgs]
     enc = processor(text=prompts,
                     images=[[DUMMY_RGB]]*len(prompts),
-                    padding=True, truncation=True, max_length=512,
+                    padding=True, truncation=True, max_length=768,
                     return_tensors="pt")
     enc["pixel_values"] = torch.stack(imgs)
     # metadata to return unchanged
@@ -219,12 +220,14 @@ def main():
                         persistent_workers=True, prefetch_factor=4,
                         collate_fn=lambda b: collate(b, proc))
 
+    END_ID  = proc.tokenizer.convert_tokens_to_ids("<end_of_turn>")
     gen_cfg = GenerationConfig(
                  max_new_tokens=args.max_new,
-                 do_sample=False,            # greedy
-                 num_beams=1,
+                 do_sample=False, num_beams=1,
                  pad_token_id=proc.tokenizer.pad_token_id,
-                 eos_token_id=proc.tokenizer.eos_token_id,
+                 eos_token_id=END_ID,
+                 no_repeat_ngram_size=4,
+                 repetition_penalty=1.1,
              )
 
     refs, hyps, meta_rows = [], [], []
@@ -236,7 +239,14 @@ def main():
         for batch_idx, (enc, meta) in enumerate(tqdm(loader, desc="inference")):
             enc = {k:v.to(device[""]) if torch.is_tensor(v) else v for k,v in enc.items()}
             gen_ids = model.generate(**enc, **gen_cfg.to_dict())
-            outs = proc.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+
+            # remove the user‑prompt portion so we don't decode it
+            outs = []
+            for ids, inp in zip(gen_ids, enc["input_ids"]):
+                prompt_len = (inp != proc.tokenizer.pad_token_id).sum().item()
+                outs.append(proc.tokenizer.decode(
+                    ids[prompt_len:],
+                    skip_special_tokens=True).strip())
 
             # Log one sample from each batch
             if batch_idx % 10 == 0:  # Log every 10th batch to avoid spam

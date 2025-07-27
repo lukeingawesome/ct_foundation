@@ -84,6 +84,35 @@ def _worker_init_fn(worker_id):
     np.random.seed()
     torch.set_num_threads(1)
 
+# ----------------------------------------------------------------------
+#  Tiny calibration layer (must match the one saved during training)
+# ----------------------------------------------------------------------
+class _AffineCalibrator(nn.Module):
+    """Per‑class temperature and bias: z' = (z + b) / T"""
+    def __init__(self, n_cls: int):
+        super().__init__()
+        self.log_T = nn.Parameter(torch.zeros(n_cls))   # T_i = exp(log_T_i) ≥ 0
+        self.bias  = nn.Parameter(torch.zeros(n_cls))   # b_i
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return (z + self.bias) / torch.exp(self.log_T)
+
+
+class CalibratedSigLIP(nn.Module):
+    """
+    Wraps the original SigLIPClassifier (“base”) with the fitted calibrator.
+    Forward returns *calibrated* logits.
+    """
+    def __init__(self, base: nn.Module, calib: _AffineCalibrator):
+        super().__init__()
+        self.base = base
+        self.calib = calib
+
+    def forward(self, x):
+        z = self.base(x)
+        return self.calib(z)
+
+
 # ───────────────────────────────────────────────────────
 class FocalBalancedLoss(nn.Module):
     """Focal loss + BCE pos‑weight (works better for extreme imbalance)."""
@@ -221,60 +250,60 @@ def evaluate(model, loader, device, labels, thresholds):
     return metrics, logits, gts
 
 # ───────────────────────────────────────────────────────
-def load_model_from_checkpoint(checkpoint_path: str, labels: List[str], device: torch.device):
-    """Load model from checkpoint."""
+def load_model_from_checkpoint(checkpoint_path: str,
+                               labels: List[str],
+                               device: torch.device):
+    """
+    Load either plain SigLIP or SigLIP + calibration, depending on what the
+    checkpoint contains.  Returns (model, thresholds).
+    """
     logging.info(f"Loading model from {checkpoint_path}")
-    
-    # Load checkpoint (set weights_only=False for compatibility with numpy arrays)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    
-    # Create the same model architecture as in training
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state = ckpt["model"]
+
+    # ------------------------------------------------------------------
+    #  Detect whether a calibrator is present (keys start with "calib.")
+    # ------------------------------------------------------------------
+    has_calib = any(k.startswith("calib.") for k in state)
+    n_cls = len(labels)
+
+    # 1️⃣  create backbone exactly like in training
     backbone = Merlin(ImageEmbedding=True)
-    model = SigLIPClassifier(backbone, len(labels), drop=0.1)
-    
-    # Load the complete model state dict
-    # Handle DDP prefix issue - checkpoint might have 'module.' prefix from distributed training
-    state_dict = checkpoint["model"]
-    
-    # Check if state dict has 'module.' prefix (from DDP training)
-    if any(key.startswith('module.') for key in state_dict.keys()):
-        logging.info("Detected DDP checkpoint, removing 'module.' prefix...")
-        # Remove 'module.' prefix from all keys
-        state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
-    
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        logging.info("Model loaded successfully with all weights")
-    except Exception as e:
-        logging.error(f"Failed to load state dict with strict=True: {e}")
-        # Try with strict=False for debugging and print ALL missing keys
-        try:
-            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-            logging.warning(f"Loaded with strict=False. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
-            
-            # Print ALL missing keys
-            if missing_keys:
-                logging.warning("ALL MISSING KEYS:")
-                for i, key in enumerate(missing_keys):
-                    logging.warning(f"  {i+1:3d}. {key}")
-            
-            # Print ALL unexpected keys  
-            if unexpected_keys:
-                logging.warning("ALL UNEXPECTED KEYS:")
-                for i, key in enumerate(unexpected_keys):
-                    logging.warning(f"  {i+1:3d}. {key}")
-                    
-        except Exception as e2:
-            logging.error(f"Failed to load state dict even with strict=False: {e2}")
-            raise RuntimeError(f"Could not load model weights: {e2}")
-    
-    model.to(device)
-    model.eval()
-    
-    # Get thresholds if available
-    thresholds = checkpoint.get("thresholds", np.full(len(labels), 0.5))
-    
-    logging.info(f"Model loaded successfully from epoch {checkpoint.get('epoch', 'unknown')}")
+    base_model = SigLIPClassifier(backbone, n_cls, drop=0.1)
+
+    if has_calib:
+        logging.info("Checkpoint contains a calibration layer – using CalibratedSigLIP")
+
+        # 2️⃣  initialise an empty calibrator
+        calib_layer = _AffineCalibrator(n_cls)
+
+        # 3️⃣  wrap both into one nn.Module
+        model = CalibratedSigLIP(base_model, calib_layer)
+    else:
+        logging.info("No calibration layer found – loading plain SigLIP model")
+        model = base_model
+
+    # --------------------------------------------------------------
+    #  Handle possible 'module.' prefixes (DDP) and load parameters
+    # --------------------------------------------------------------
+    if any(k.startswith("module.") for k in state):
+        state = {k.replace("module.", "", 1): v for k, v in state.items()}
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        logging.warning(f"Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
+
+    model.to(device).eval()
+
+    # If you exported the calibrated model, you no longer need per‑class thresholds:
+    # the decision point is exactly 0.5.  Otherwise fall back to what the
+    # training script saved (or a scalar 0.5 if absent).
+    if has_calib:
+        thresholds = np.full(n_cls, 0.5, dtype=np.float32)
+    else:
+        thresholds = ckpt.get("thresholds", np.full(n_cls, 0.5, dtype=np.float32))
+
+    logging.info("Model ready for inference")
     return model, thresholds
 
 # ───────────────────────────────────────────────────────

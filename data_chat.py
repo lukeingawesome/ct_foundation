@@ -92,7 +92,7 @@ def chat_collate(batch, processor):
         images=[[DUMMY]] * len(texts),   # list‑of‑lists → 1 dummy per sample
         padding=True,
         truncation=True,
-        max_length=512,
+        max_length=1024,
         return_tensors="pt"
     )
 
@@ -105,5 +105,13 @@ def chat_collate(batch, processor):
                processor.image_token_id]
     for tok in special:
         labels[labels == tok] = -100
+
+    # 2) mask everything up to and including <assistant>
+    assistant_id = processor.tokenizer.convert_tokens_to_ids("<assistant>")
+    for i in range(labels.size(0)):
+        idx = (enc["input_ids"][i] == assistant_id).nonzero(as_tuple=True)
+        if idx[0].numel():                      # safety check
+            labels[i, : idx[0].item() + 1] = -100
+
     enc["labels"] = labels
     return enc 
